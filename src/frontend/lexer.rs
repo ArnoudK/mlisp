@@ -11,6 +11,7 @@ pub struct Token {
 pub enum TokenKind {
     LParen,
     RParen,
+    Dot,
     Quote,
     Integer(i64),
     Boolean(bool),
@@ -48,6 +49,16 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
             b')' => {
                 tokens.push(Token {
                     kind: TokenKind::RParen,
+                    span: Span {
+                        start: index,
+                        end: index + 1,
+                    },
+                });
+                index += 1;
+            }
+            b'.' if index + 1 == bytes.len() || is_delimiter(bytes[index + 1]) => {
+                tokens.push(Token {
+                    kind: TokenKind::Dot,
                     span: Span {
                         start: index,
                         end: index + 1,

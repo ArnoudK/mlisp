@@ -185,6 +185,32 @@ impl SharedRoot {
     }
 }
 
+struct RootStackGuard {
+    thread: *mut core::ffi::c_void,
+    count: usize,
+}
+
+impl RootStackGuard {
+    fn new(thread: *mut core::ffi::c_void) -> Self {
+        Self { thread, count: 0 }
+    }
+
+    fn push(&mut self, slot: *mut usize) -> Result<(), RuntimeError> {
+        push_root_checked(self.thread, slot)?;
+        self.count += 1;
+        Ok(())
+    }
+}
+
+impl Drop for RootStackGuard {
+    fn drop(&mut self) {
+        while self.count > 0 {
+            let _ = pop_root_checked(self.thread);
+            self.count -= 1;
+        }
+    }
+}
+
 fn runtime() -> &'static RuntimeState {
     RUNTIME.get().ok_or(RuntimeError::NotInitialized).unwrap()
 }
@@ -398,6 +424,12 @@ pub fn alloc_pair(car: Value, cdr: Value) -> ObjectReference {
 }
 
 pub fn alloc_pair_checked(car: Value, cdr: Value) -> Result<ObjectReference, RuntimeError> {
+    let thread = current_thread();
+    let mut rooted_car = car.bits();
+    let mut rooted_cdr = cdr.bits();
+    let mut roots = RootStackGuard::new(thread);
+    roots.push(&mut rooted_car)?;
+    roots.push(&mut rooted_cdr)?;
     let object = alloc_raw_checked(
         core::mem::size_of::<PairObject>(),
         core::mem::align_of::<PairObject>(),
@@ -405,8 +437,8 @@ pub fn alloc_pair_checked(car: Value, cdr: Value) -> Result<ObjectReference, Run
     )?;
     unsafe {
         let pair = object.to_raw_address().to_mut_ptr::<PairObject>();
-        (*pair).car = car.bits();
-        (*pair).cdr = cdr.bits();
+        (*pair).car = rooted_car;
+        (*pair).cdr = rooted_cdr;
     }
     Ok(object)
 }
@@ -416,6 +448,10 @@ pub fn alloc_box(value: Value) -> ObjectReference {
 }
 
 pub fn alloc_box_checked(value: Value) -> Result<ObjectReference, RuntimeError> {
+    let thread = current_thread();
+    let mut rooted_value = value.bits();
+    let mut roots = RootStackGuard::new(thread);
+    roots.push(&mut rooted_value)?;
     let object = alloc_raw_checked(
         core::mem::size_of::<BoxObject>(),
         core::mem::align_of::<BoxObject>(),
@@ -423,7 +459,7 @@ pub fn alloc_box_checked(value: Value) -> Result<ObjectReference, RuntimeError> 
     )?;
     unsafe {
         let boxed = object.to_raw_address().to_mut_ptr::<BoxObject>();
-        (*boxed).value = value.bits();
+        (*boxed).value = rooted_value;
     }
     Ok(object)
 }
@@ -436,6 +472,12 @@ pub fn alloc_closure_checked(
     code_ptr: usize,
     env: &[Value],
 ) -> Result<ObjectReference, RuntimeError> {
+    let thread = current_thread();
+    let mut rooted_env = env.to_vec();
+    let mut roots = RootStackGuard::new(thread);
+    for value in &mut rooted_env {
+        roots.push(&mut value.0)?;
+    }
     let size = core::mem::size_of::<ClosureObject>() + (env.len() * core::mem::size_of::<usize>());
     let object = alloc_raw_checked(
         size,
@@ -446,9 +488,9 @@ pub fn alloc_closure_checked(
         let closure = object.to_raw_address().to_mut_ptr::<ClosureObject>();
         ptr::write(closure, ClosureObject::new(code_ptr, env.len(), size));
         ptr::copy_nonoverlapping(
-            env.as_ptr().cast::<usize>(),
+            rooted_env.as_ptr().cast::<usize>(),
             (*closure).env_mut_ptr(),
-            env.len(),
+            rooted_env.len(),
         );
     }
     Ok(object)
@@ -485,6 +527,12 @@ pub fn alloc_symbol_checked(bytes: &[u8]) -> Result<ObjectReference, RuntimeErro
 }
 
 pub fn alloc_vector_checked(elements: &[Value]) -> Result<ObjectReference, RuntimeError> {
+    let thread = current_thread();
+    let mut rooted_elements = elements.to_vec();
+    let mut roots = RootStackGuard::new(thread);
+    for value in &mut rooted_elements {
+        roots.push(&mut value.0)?;
+    }
     let size = core::mem::size_of::<VectorObject>() + (elements.len() * core::mem::size_of::<usize>());
     let object = alloc_raw_checked(
         size,
@@ -495,9 +543,9 @@ pub fn alloc_vector_checked(elements: &[Value]) -> Result<ObjectReference, Runti
         let vector = object.to_raw_address().to_mut_ptr::<VectorObject>();
         ptr::write(vector, VectorObject::new(elements.len(), size));
         ptr::copy_nonoverlapping(
-            elements.as_ptr().cast::<usize>(),
+            rooted_elements.as_ptr().cast::<usize>(),
             (*vector).elements_mut_ptr(),
-            elements.len(),
+            rooted_elements.len(),
         );
     }
     Ok(object)
@@ -516,13 +564,15 @@ pub fn object_write_post_checked(
         return Err(RuntimeError::NullSlot);
     }
     unsafe { ptr::write(slot, target.bits()) };
-    let thread = current_thread_context_checked()?;
-    memory_manager::object_reference_write_post(
-        unsafe { &mut *thread.mutator },
-        src,
-        ValueSlot::from_ptr(slot),
-        target.to_object_reference(),
-    );
+    if target.is_heap_ref() {
+        let thread = current_thread_context_checked()?;
+        memory_manager::object_reference_write_post(
+            unsafe { &mut *thread.mutator },
+            src,
+            ValueSlot::from_ptr(slot),
+            target.to_object_reference(),
+        );
+    }
     Ok(())
 }
 

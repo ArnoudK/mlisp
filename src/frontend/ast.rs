@@ -18,6 +18,9 @@ pub enum ExprKind {
     Char(char),
     String(String),
     Symbol(String),
-    List(Vec<Expr>),
+    List {
+        items: Vec<Expr>,
+        tail: Option<Box<Expr>>,
+    },
     Quote(Box<Expr>),
 }

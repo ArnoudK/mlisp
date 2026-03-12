@@ -1,6 +1,6 @@
 use crate::error::CompileError;
 use crate::frontend::ast::{Expr as AstExpr, ExprKind as AstExprKind, Program as AstProgram};
-use crate::middle::hir::{Binding, Datum, Expr, ExprKind, Procedure, Program, TopLevel};
+use crate::middle::hir::{Binding, Datum, Expr, ExprKind, Formals, Procedure, Program, TopLevel};
 
 pub fn lower_program(program: &AstProgram) -> Result<Program, CompileError> {
     let mut lowerer = Lowerer { gensym_counter: 0 };
@@ -17,7 +17,7 @@ struct Lowerer {
 
 impl Lowerer {
     fn lower_top_level(&mut self, form: &AstExpr) -> Result<TopLevel, CompileError> {
-        if let AstExprKind::List(items) = &form.kind {
+        if let AstExprKind::List { items, tail: None } = &form.kind {
             if let Some(AstExpr {
                 kind: AstExprKind::Symbol(symbol),
                 ..
@@ -44,7 +44,7 @@ impl Lowerer {
                             value,
                         });
                     }
-                    AstExprKind::List(signature) => {
+                    AstExprKind::List { items: signature, tail } => {
                         let Some(name_expr) = signature.first() else {
                             return Err(CompileError::Lower(
                                 "procedure define requires a non-empty signature".into(),
@@ -60,18 +60,13 @@ impl Lowerer {
                             }
                         };
 
-                        let params = signature[1..]
-                            .iter()
-                            .map(|param| match &param.kind {
-                                AstExprKind::Symbol(symbol) => Ok(symbol.clone()),
-                                _ => Err(CompileError::Lower(
-                                    "procedure parameters must be symbols".into(),
-                                )),
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-
+                        let formals = self.lower_formals(&signature[1..], tail.as_deref())?;
                         let body = self.lower_body(&items[2..])?;
-                        return Ok(TopLevel::Procedure(Procedure { name, params, body }));
+                        return Ok(TopLevel::Procedure(Procedure {
+                            name,
+                            formals,
+                            body,
+                        }));
                     }
                     _ => {
                         return Err(CompileError::Lower(
@@ -93,13 +88,18 @@ impl Lowerer {
             AstExprKind::String(value) => ExprKind::String(value.clone()),
             AstExprKind::Symbol(symbol) => ExprKind::Variable(symbol.clone()),
             AstExprKind::Quote(quoted) => ExprKind::Quote(self.lower_datum(quoted)?),
-            AstExprKind::List(items) => self.lower_list(items)?,
+            AstExprKind::List { items, tail } => self.lower_list(items, tail.as_deref())?,
         };
 
         Ok(Expr { kind })
     }
 
-    fn lower_list(&mut self, items: &[AstExpr]) -> Result<ExprKind, CompileError> {
+    fn lower_list(&mut self, items: &[AstExpr], tail: Option<&AstExpr>) -> Result<ExprKind, CompileError> {
+        if tail.is_some() {
+            return Err(CompileError::Lower(
+                "dotted lists are only valid in data and formal parameter positions".into(),
+            ));
+        }
         let Some(head) = items.first() else {
             return Ok(ExprKind::Begin(Vec::new()));
         };
@@ -151,19 +151,17 @@ impl Lowerer {
                         ));
                     }
 
-                    let params = match &items[1].kind {
-                        AstExprKind::List(params) => params
-                            .iter()
-                            .map(|param| match &param.kind {
-                                AstExprKind::Symbol(symbol) => Ok(symbol.clone()),
-                                _ => Err(CompileError::Lower(
-                                    "lambda parameters must be symbols".into(),
-                                )),
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
+                    let formals = match &items[1].kind {
+                        AstExprKind::List { items, tail } => {
+                            self.lower_formals(items, tail.as_deref())?
+                        }
+                        AstExprKind::Symbol(symbol) => Formals {
+                            required: Vec::new(),
+                            rest: Some(symbol.clone()),
+                        },
                         _ => {
                             return Err(CompileError::Lower(
-                                "lambda parameter list must be a list".into(),
+                                "lambda parameter list must be a list or symbol".into(),
                             ));
                         }
                     };
@@ -171,7 +169,7 @@ impl Lowerer {
                     let body = self.lower_body(&items[2..])?;
 
                     return Ok(ExprKind::Lambda {
-                        params,
+                        formals,
                         body: Box::new(body),
                     });
                 }
@@ -288,7 +286,7 @@ impl Lowerer {
         }
 
         let bindings = match &items[0].kind {
-            AstExprKind::List(bindings) => bindings
+            AstExprKind::List { items: bindings, tail: None } => bindings
                 .iter()
                 .map(|binding| self.lower_binding(binding))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -307,7 +305,7 @@ impl Lowerer {
         let Some((first, rest)) = clauses.split_first() else {
             return Ok(ExprKind::Unspecified);
         };
-        let AstExprKind::List(items) = &first.kind else {
+        let AstExprKind::List { items, tail: None } = &first.kind else {
             return Err(CompileError::Lower("cond clause must be a list".into()));
         };
         if items.is_empty() {
@@ -391,15 +389,20 @@ impl Lowerer {
             AstExprKind::Char(value) => Ok(Datum::Char(*value)),
             AstExprKind::String(value) => Ok(Datum::String(value.clone())),
             AstExprKind::Symbol(symbol) => Ok(Datum::Symbol(symbol.clone())),
-            AstExprKind::List(items) => items
-                .iter()
-                .map(|expr| self.lower_datum(expr))
-                .collect::<Result<Vec<_>, _>>()
-                .map(Datum::List),
-            AstExprKind::Quote(quoted) => Ok(Datum::List(vec![
-                Datum::Symbol("quote".into()),
-                self.lower_datum(quoted)?,
-            ])),
+            AstExprKind::List { items, tail } => Ok(Datum::List {
+                items: items
+                    .iter()
+                    .map(|expr| self.lower_datum(expr))
+                    .collect::<Result<Vec<_>, _>>()?,
+                tail: tail
+                    .as_deref()
+                    .map(|expr| self.lower_datum(expr).map(Box::new))
+                    .transpose()?,
+            }),
+            AstExprKind::Quote(quoted) => Ok(Datum::List {
+                items: vec![Datum::Symbol("quote".into()), self.lower_datum(quoted)?],
+                tail: None,
+            }),
         }
     }
 
@@ -415,7 +418,7 @@ impl Lowerer {
         }
 
         let bindings = match &items[0].kind {
-            AstExprKind::List(bindings) => bindings
+            AstExprKind::List { items: bindings, tail: None } => bindings
                 .iter()
                 .map(|binding| self.lower_binding(binding))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -435,7 +438,7 @@ impl Lowerer {
     }
 
     fn lower_binding(&mut self, expr: &AstExpr) -> Result<Binding, CompileError> {
-        let AstExprKind::List(items) = &expr.kind else {
+        let AstExprKind::List { items, tail: None } = &expr.kind else {
             return Err(CompileError::Lower(
                 "binding must be a two-item list".into(),
             ));
@@ -456,6 +459,35 @@ impl Lowerer {
 
         let value = self.lower_expr(&items[1])?;
         Ok(Binding { name, value })
+    }
+
+    fn lower_formals(
+        &mut self,
+        required: &[AstExpr],
+        tail: Option<&AstExpr>,
+    ) -> Result<Formals, CompileError> {
+        let required = required
+            .iter()
+            .map(|param| match &param.kind {
+                AstExprKind::Symbol(symbol) => Ok(symbol.clone()),
+                _ => Err(CompileError::Lower(
+                    "procedure parameters must be symbols".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rest = match tail {
+            Some(AstExpr {
+                kind: AstExprKind::Symbol(symbol),
+                ..
+            }) => Some(symbol.clone()),
+            Some(_) => {
+                return Err(CompileError::Lower(
+                    "dotted parameter tail must be a symbol".into(),
+                ));
+            }
+            None => None,
+        };
+        Ok(Formals { required, rest })
     }
 
     fn gensym(&mut self, prefix: &str) -> String {

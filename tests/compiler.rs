@@ -35,6 +35,27 @@ fn lowers_letrec_star_to_nested_letrec() {
 }
 
 #[test]
+fn parses_dotted_quote_and_variadic_formals() {
+    let ast = parse_program("'(1 . 2)\n(lambda (x y . rest) rest)\n(lambda args args)\n").unwrap();
+    let rendered = format!("{ast:#?}");
+
+    assert!(rendered.contains("tail: Some"));
+    assert!(rendered.contains("\"rest\""));
+    assert!(rendered.contains("\"args\""));
+}
+
+#[test]
+fn lowers_variadic_lambda_and_dotted_quote() {
+    let ast = parse_program("((lambda (x . rest) rest) 1 2 3)\n'(1 . 2)\n").unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let rendered = format!("{hir:#?}");
+
+    assert!(rendered.contains("rest: Some("));
+    assert!(rendered.contains("Datum::List") || rendered.contains("List {"));
+    assert!(rendered.contains("tail: Some"));
+}
+
+#[test]
 fn emits_addition_ir() {
     let ast = parse_program("(define answer 41)\n(+ answer 1)\n").unwrap();
     let hir = lower_program(&ast).unwrap();
@@ -42,6 +63,38 @@ fn emits_addition_ir() {
 
     assert!(compiled.llvm_ir.contains("define i64 @main"));
     assert!(compiled.llvm_ir.contains("ret i64 85"));
+}
+
+#[test]
+fn emits_variadic_procedure_with_rest_list_parameter() {
+    let ast = parse_program("(define (tail x . rest) rest)\n(tail 1 2 3)\n").unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let compiled = LlvmBackend::compile_program("variadic_proc_module", &hir).unwrap();
+
+    assert!(compiled.llvm_ir.contains("define i64 @tail(i64 %0, i64 %1)"));
+    assert!(compiled.llvm_ir.contains("call ptr addrspace(1) @__mlisp_alloc_pair_gc_as1"));
+    assert!(compiled.llvm_ir.contains("call i64 @tail(i64 3, i64"));
+}
+
+#[test]
+fn emits_variadic_lambda_with_rest_list_parameter() {
+    let ast = parse_program("((lambda (x y . rest) rest) 1 2 3 4)\n").unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let compiled = LlvmBackend::compile_program("variadic_lambda_module", &hir).unwrap();
+
+    assert!(compiled.llvm_ir.contains("define i64 @__lambda_0(i64 %0, i64 %1, i64 %2)"));
+    assert!(compiled.llvm_ir.contains("call ptr addrspace(1) @__mlisp_alloc_pair_gc_as1"));
+    assert!(compiled.llvm_ir.contains("call i64 @__lambda_0(i64 3, i64 5, i64"));
+}
+
+#[test]
+fn emits_symbol_form_rest_lambda() {
+    let ast = parse_program("((lambda args args) 1 2)\n").unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let compiled = LlvmBackend::compile_program("rest_only_lambda_module", &hir).unwrap();
+
+    assert!(compiled.llvm_ir.contains("define i64 @__lambda_0(i64 %0)"));
+    assert!(compiled.llvm_ir.contains("call i64 @__lambda_0(i64"));
 }
 
 #[test]
@@ -204,11 +257,8 @@ fn allocates_pairs_on_heap_but_keeps_fixnums_immediate() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("pair_module", &hir).unwrap();
 
-    assert!(
-        compiled
-            .llvm_ir
-            .contains("call ptr addrspace(1) @__mlisp_alloc_pair_gc_as1(i64 3, i64 5)")
-    );
+    assert!(compiled.llvm_ir.contains("@__mlisp_alloc_pair_gc_as1"));
+    assert!(compiled.llvm_ir.contains("call void @rt_root_slot_push"));
     assert!(compiled.llvm_ir.contains("call i64 @__mlisp_pair_car_gc_as1"));
 }
 
@@ -223,11 +273,8 @@ fn supports_pair_and_null_predicates() {
     let pair_ir = LlvmBackend::compile_program("pair_predicate_module", &pair_hir).unwrap();
     let null_ir = LlvmBackend::compile_program("null_predicate_module", &null_hir).unwrap();
 
-    assert!(
-        pair_ir
-            .llvm_ir
-            .contains("call ptr addrspace(1) @__mlisp_alloc_pair_gc_as1(i64 3, i64 5)")
-    );
+    assert!(pair_ir.llvm_ir.contains("@__mlisp_alloc_pair_gc_as1"));
+    assert!(pair_ir.llvm_ir.contains("call void @rt_root_slot_push"));
     assert!(pair_ir.llvm_ir.contains("ret i64 6"));
     assert!(null_ir.llvm_ir.contains("ret i64 6"));
 }
@@ -422,6 +469,24 @@ fn compiles_list_ref_tail_and_append() {
     assert!(ref_ir.llvm_ir.contains("@mlisp_list_ref"));
     assert!(tail_ir.llvm_ir.contains("@mlisp_list_tail"));
     assert!(append_ir.llvm_ir.contains("@mlisp_append"));
+}
+
+#[test]
+fn compiles_pair_mutation_and_list_copy_reverse() {
+    let mutate_ast = parse_program("(let ((p (cons 1 2))) (begin (set-car! p 9) (set-cdr! p '()) p))\n").unwrap();
+    let copy_ast = parse_program("(list-copy (list 1 2 3))\n").unwrap();
+    let reverse_ast = parse_program("(reverse (list 1 2 3))\n").unwrap();
+    let mutate_hir = lower_program(&mutate_ast).unwrap();
+    let copy_hir = lower_program(&copy_ast).unwrap();
+    let reverse_hir = lower_program(&reverse_ast).unwrap();
+    let mutate_ir = LlvmBackend::compile_program("pair_set_module", &mutate_hir).unwrap();
+    let copy_ir = LlvmBackend::compile_program("list_copy_module", &copy_hir).unwrap();
+    let reverse_ir = LlvmBackend::compile_program("reverse_module", &reverse_hir).unwrap();
+
+    assert!(mutate_ir.llvm_ir.contains("@mlisp_pair_set_car"));
+    assert!(mutate_ir.llvm_ir.contains("@mlisp_pair_set_cdr"));
+    assert!(copy_ir.llvm_ir.contains("@mlisp_list_copy"));
+    assert!(reverse_ir.llvm_ir.contains("@mlisp_reverse"));
 }
 
 #[test]

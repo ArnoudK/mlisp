@@ -10,6 +10,8 @@ pub struct RuntimeAbi<'ctx> {
     pub rt_alloc_slow: FunctionValue<'ctx>,
     pub rt_gc_poll: FunctionValue<'ctx>,
     pub rt_object_write_post: FunctionValue<'ctx>,
+    pub rt_root_slot_push: FunctionValue<'ctx>,
+    pub rt_root_slot_pop: FunctionValue<'ctx>,
     pub gc_safepoint_poll: FunctionValue<'ctx>,
     pub make_fixnum: FunctionValue<'ctx>,
     pub make_bool: FunctionValue<'ctx>,
@@ -25,12 +27,18 @@ pub struct RuntimeAbi<'ctx> {
     pub pair_cdr: FunctionValue<'ctx>,
     pub pair_car_gc: FunctionValue<'ctx>,
     pub pair_cdr_gc: FunctionValue<'ctx>,
+    pub pair_set_car: FunctionValue<'ctx>,
+    pub pair_set_cdr: FunctionValue<'ctx>,
+    pub pair_set_car_gc: FunctionValue<'ctx>,
+    pub pair_set_cdr_gc: FunctionValue<'ctx>,
     pub is_pair: FunctionValue<'ctx>,
     pub is_list: FunctionValue<'ctx>,
     pub list_length: FunctionValue<'ctx>,
     pub list_tail: FunctionValue<'ctx>,
     pub list_ref: FunctionValue<'ctx>,
     pub append: FunctionValue<'ctx>,
+    pub list_copy: FunctionValue<'ctx>,
+    pub reverse: FunctionValue<'ctx>,
     pub alloc_box: FunctionValue<'ctx>,
     pub alloc_box_gc: FunctionValue<'ctx>,
     pub box_set_gc: FunctionValue<'ctx>,
@@ -81,6 +89,16 @@ impl<'ctx> RuntimeAbi<'ctx> {
             module.add_function("mlisp_alloc_pair_gc", raw_pair_alloc_fn, None);
         let pair_car_gc_raw = module.add_function("mlisp_pair_car_gc", raw_pair_access_fn, None);
         let pair_cdr_gc_raw = module.add_function("mlisp_pair_cdr_gc", raw_pair_access_fn, None);
+        let pair_set_car_gc_raw = module.add_function(
+            "mlisp_pair_set_car_gc",
+            word.fn_type(&[raw_ptr.into(), word.into()], false),
+            None,
+        );
+        let pair_set_cdr_gc_raw = module.add_function(
+            "mlisp_pair_set_cdr_gc",
+            word.fn_type(&[raw_ptr.into(), word.into()], false),
+            None,
+        );
         let alloc_string_gc_raw = module.add_function(
             "mlisp_alloc_string_gc",
             raw_ptr.fn_type(&[raw_ptr.into(), word.into()], false),
@@ -143,6 +161,10 @@ impl<'ctx> RuntimeAbi<'ctx> {
         let alloc_pair_gc = add_gc_alloc_wrapper(module, "__mlisp_alloc_pair_gc_as1", alloc_pair_gc_raw);
         let pair_car_gc = add_gc_unary_wrapper(module, "__mlisp_pair_car_gc_as1", pair_car_gc_raw);
         let pair_cdr_gc = add_gc_unary_wrapper(module, "__mlisp_pair_cdr_gc_as1", pair_cdr_gc_raw);
+        let pair_set_car_gc =
+            add_gc_unary_value_wrapper(module, "__mlisp_pair_set_car_gc_as1", pair_set_car_gc_raw);
+        let pair_set_cdr_gc =
+            add_gc_unary_value_wrapper(module, "__mlisp_pair_set_cdr_gc_as1", pair_set_cdr_gc_raw);
         let alloc_string_gc =
             add_gc_buffer_alloc_wrapper(module, "__mlisp_alloc_string_gc_as1", alloc_string_gc_raw);
         let alloc_symbol_gc =
@@ -194,6 +216,16 @@ impl<'ctx> RuntimeAbi<'ctx> {
                     .fn_type(&[raw_ptr.into(), raw_ptr.into(), word.into()], false),
                 None,
             ),
+            rt_root_slot_push: module.add_function(
+                "rt_root_slot_push",
+                context.void_type().fn_type(&[raw_ptr.into()], false),
+                None,
+            ),
+            rt_root_slot_pop: module.add_function(
+                "rt_root_slot_pop",
+                context.void_type().fn_type(&[], false),
+                None,
+            ),
             gc_safepoint_poll: module.get_function("gc_safepoint_poll").unwrap_or_else(|| {
                 module.add_function(
                     "gc_safepoint_poll",
@@ -223,6 +255,10 @@ impl<'ctx> RuntimeAbi<'ctx> {
             pair_cdr: module.add_function("mlisp_pair_cdr", word_word_fn, None),
             pair_car_gc,
             pair_cdr_gc,
+            pair_set_car: module.add_function("mlisp_pair_set_car", pair_fn, None),
+            pair_set_cdr: module.add_function("mlisp_pair_set_cdr", pair_fn, None),
+            pair_set_car_gc,
+            pair_set_cdr_gc,
             is_pair: module.add_function(
                 "mlisp_is_pair",
                 bool_ty.fn_type(&[word.into()], false),
@@ -237,6 +273,8 @@ impl<'ctx> RuntimeAbi<'ctx> {
             list_tail: module.add_function("mlisp_list_tail", pair_fn, None),
             list_ref: module.add_function("mlisp_list_ref", pair_fn, None),
             append: module.add_function("mlisp_append", pair_fn, None),
+            list_copy: module.add_function("mlisp_list_copy", word_word_fn, None),
+            reverse: module.add_function("mlisp_reverse", word_word_fn, None),
             alloc_box: module.add_function("mlisp_alloc_box", word_word_fn, None),
             alloc_box_gc,
             box_set_gc,
@@ -566,6 +604,8 @@ mod tests {
             abi.rt_object_write_post.get_name().to_str(),
             Ok("rt_object_write_post")
         );
+        assert_eq!(abi.rt_root_slot_push.get_name().to_str(), Ok("rt_root_slot_push"));
+        assert_eq!(abi.rt_root_slot_pop.get_name().to_str(), Ok("rt_root_slot_pop"));
         assert_eq!(
             abi.gc_safepoint_poll.get_name().to_str(),
             Ok("gc_safepoint_poll")
@@ -581,12 +621,18 @@ mod tests {
         assert_eq!(abi.pair_cdr.get_name().to_str(), Ok("mlisp_pair_cdr"));
         assert_eq!(abi.pair_car_gc.get_name().to_str(), Ok("__mlisp_pair_car_gc_as1"));
         assert_eq!(abi.pair_cdr_gc.get_name().to_str(), Ok("__mlisp_pair_cdr_gc_as1"));
+        assert_eq!(abi.pair_set_car.get_name().to_str(), Ok("mlisp_pair_set_car"));
+        assert_eq!(abi.pair_set_cdr.get_name().to_str(), Ok("mlisp_pair_set_cdr"));
+        assert_eq!(abi.pair_set_car_gc.get_name().to_str(), Ok("__mlisp_pair_set_car_gc_as1"));
+        assert_eq!(abi.pair_set_cdr_gc.get_name().to_str(), Ok("__mlisp_pair_set_cdr_gc_as1"));
         assert_eq!(abi.is_pair.get_name().to_str(), Ok("mlisp_is_pair"));
         assert_eq!(abi.is_list.get_name().to_str(), Ok("mlisp_is_list"));
         assert_eq!(abi.list_length.get_name().to_str(), Ok("mlisp_list_length"));
         assert_eq!(abi.list_tail.get_name().to_str(), Ok("mlisp_list_tail"));
         assert_eq!(abi.list_ref.get_name().to_str(), Ok("mlisp_list_ref"));
         assert_eq!(abi.append.get_name().to_str(), Ok("mlisp_append"));
+        assert_eq!(abi.list_copy.get_name().to_str(), Ok("mlisp_list_copy"));
+        assert_eq!(abi.reverse.get_name().to_str(), Ok("mlisp_reverse"));
         assert_eq!(abi.alloc_box_gc.get_name().to_str(), Ok("__mlisp_alloc_box_gc_as1"));
         assert_eq!(abi.box_set_gc.get_name().to_str(), Ok("__mlisp_box_set_gc_as1"));
         assert_eq!(

@@ -1,10 +1,10 @@
 use crate::error::RuntimeError;
 use crate::mmtk::{
     alloc_box_checked, alloc_closure_checked, alloc_pair_checked, alloc_raw_checked,
-    alloc_string_checked, alloc_symbol_checked, alloc_vector_checked, bind_thread_handle, current_thread,
-    gc_poll_current_checked, initialize_runtime, object_write_post_checked, pop_root_checked,
-    push_root_checked, register_global_root_checked, run_mutator_stress_checked, gc_stress_checked,
-    unbind_thread_handle,
+    alloc_string_checked, alloc_symbol_checked, alloc_vector_checked, bind_thread_handle,
+    current_thread, gc_poll_current_checked, gc_stress_checked, initialize_runtime,
+    object_write_post_checked, pop_root_checked, push_root_checked, register_global_root_checked,
+    run_mutator_stress_checked, unbind_thread_handle,
 };
 use crate::object::{ClosureObject, PairObject, StringObject, SymbolObject, VectorObject};
 use crate::value::Value;
@@ -15,7 +15,38 @@ fn object_kind(value: Value) -> Result<u16, RuntimeError> {
     let object = value
         .to_object_reference()
         .ok_or(RuntimeError::InvalidObjectKind)?;
-    Ok(unsafe { (*object.to_raw_address().to_ptr::<crate::layout::ObjectHeader>()).kind })
+    Ok(unsafe {
+        (*object
+            .to_raw_address()
+            .to_ptr::<crate::layout::ObjectHeader>())
+        .kind
+    })
+}
+
+struct RootGuard {
+    thread: *mut core::ffi::c_void,
+    count: usize,
+}
+
+impl RootGuard {
+    fn new(thread: *mut core::ffi::c_void) -> Self {
+        Self { thread, count: 0 }
+    }
+
+    fn push(&mut self, slot: *mut usize) -> Result<(), RuntimeError> {
+        push_root_checked(self.thread, slot)?;
+        self.count += 1;
+        Ok(())
+    }
+}
+
+impl Drop for RootGuard {
+    fn drop(&mut self) {
+        while self.count > 0 {
+            let _ = pop_root_checked(self.thread);
+            self.count -= 1;
+        }
+    }
 }
 
 fn ffi_bool<F>(func: F) -> bool
@@ -59,7 +90,11 @@ fn display_value(writer: &mut dyn Write, value: Value) -> Result<(), RuntimeErro
     write_value(writer, value, false)
 }
 
-fn write_value(writer: &mut dyn Write, value: Value, quoted_strings: bool) -> Result<(), RuntimeError> {
+fn write_value(
+    writer: &mut dyn Write,
+    value: Value,
+    quoted_strings: bool,
+) -> Result<(), RuntimeError> {
     if let Some(fixnum) = value.decode_fixnum() {
         write!(writer, "{fixnum}").map_err(|error| RuntimeError::io_like(error))?;
         return Ok(());
@@ -67,11 +102,15 @@ fn write_value(writer: &mut dyn Write, value: Value, quoted_strings: bool) -> Re
 
     match value.decode_immediate() {
         Some(crate::value::Immediate::Bool(true)) => {
-            writer.write_all(b"#t").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b"#t")
+                .map_err(|error| RuntimeError::io_like(error))?;
             return Ok(());
         }
         Some(crate::value::Immediate::Bool(false)) => {
-            writer.write_all(b"#f").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b"#f")
+                .map_err(|error| RuntimeError::io_like(error))?;
             return Ok(());
         }
         Some(crate::value::Immediate::Char(value)) => {
@@ -81,14 +120,18 @@ fn write_value(writer: &mut dyn Write, value: Value, quoted_strings: bool) -> Re
                 value => {
                     let mut buffer = [0u8; 4];
                     let encoded = value.encode_utf8(&mut buffer);
-                    writer.write_all(b"#\\").and_then(|_| writer.write_all(encoded.as_bytes()))
+                    writer
+                        .write_all(b"#\\")
+                        .and_then(|_| writer.write_all(encoded.as_bytes()))
                 }
             }
             .map_err(|error| RuntimeError::io_like(error))?;
             return Ok(());
         }
         Some(crate::value::Immediate::EmptyList) => {
-            writer.write_all(b"()").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b"()")
+                .map_err(|error| RuntimeError::io_like(error))?;
             return Ok(());
         }
         Some(crate::value::Immediate::Unspecified) => {
@@ -106,41 +149,61 @@ fn write_value(writer: &mut dyn Write, value: Value, quoted_strings: bool) -> Re
     match object_kind(value)? {
         crate::layout::HEADER_TAG_PAIR => {
             let pair = unsafe { &*object.to_raw_address().to_ptr::<PairObject>() };
-            writer.write_all(b"(").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b"(")
+                .map_err(|error| RuntimeError::io_like(error))?;
             display_pair(writer, pair)?;
-            writer.write_all(b")").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b")")
+                .map_err(|error| RuntimeError::io_like(error))?;
         }
         crate::layout::HEADER_TAG_STRING => {
             let string = unsafe { &*object.to_raw_address().to_ptr::<StringObject>() };
             let bytes = unsafe { core::slice::from_raw_parts(string.bytes_ptr(), string.length) };
             if quoted_strings {
-                writer.write_all(b"\"").map_err(|error| RuntimeError::io_like(error))?;
+                writer
+                    .write_all(b"\"")
+                    .map_err(|error| RuntimeError::io_like(error))?;
             }
-            writer.write_all(bytes).map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(bytes)
+                .map_err(|error| RuntimeError::io_like(error))?;
             if quoted_strings {
-                writer.write_all(b"\"").map_err(|error| RuntimeError::io_like(error))?;
+                writer
+                    .write_all(b"\"")
+                    .map_err(|error| RuntimeError::io_like(error))?;
             }
         }
         crate::layout::HEADER_TAG_SYMBOL => {
             let symbol = unsafe { &*object.to_raw_address().to_ptr::<SymbolObject>() };
             let bytes = unsafe { core::slice::from_raw_parts(symbol.bytes_ptr(), symbol.length) };
-            writer.write_all(bytes).map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(bytes)
+                .map_err(|error| RuntimeError::io_like(error))?;
         }
         crate::layout::HEADER_TAG_VECTOR => {
             let vector = unsafe { &*object.to_raw_address().to_ptr::<VectorObject>() };
-            writer.write_all(b"#(").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b"#(")
+                .map_err(|error| RuntimeError::io_like(error))?;
             for index in 0..vector.length {
                 if index != 0 {
-                    writer.write_all(b" ").map_err(|error| RuntimeError::io_like(error))?;
+                    writer
+                        .write_all(b" ")
+                        .map_err(|error| RuntimeError::io_like(error))?;
                 }
                 let element = Value::from_bits(unsafe { *vector.elements_ptr().add(index) });
                 write_value(writer, element, quoted_strings)?;
             }
-            writer.write_all(b")").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b")")
+                .map_err(|error| RuntimeError::io_like(error))?;
         }
         crate::layout::HEADER_TAG_BOX => {
             let boxed = unsafe { &*object.to_raw_address().to_ptr::<crate::object::BoxObject>() };
-            writer.write_all(b"#&").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b"#&")
+                .map_err(|error| RuntimeError::io_like(error))?;
             write_value(writer, boxed.value(), quoted_strings)?;
         }
         crate::layout::HEADER_TAG_CLOSURE => {
@@ -164,14 +227,22 @@ fn display_pair(writer: &mut dyn Write, pair: &PairObject) -> Result<(), Runtime
         Some(crate::value::Immediate::EmptyList) => Ok(()),
         _ => {
             if let Some(object) = pair.cdr().to_object_reference()
-                && unsafe { (*object.to_raw_address().to_ptr::<crate::layout::ObjectHeader>()).kind }
-                    == crate::layout::HEADER_TAG_PAIR
+                && unsafe {
+                    (*object
+                        .to_raw_address()
+                        .to_ptr::<crate::layout::ObjectHeader>())
+                    .kind
+                } == crate::layout::HEADER_TAG_PAIR
             {
                 let cdr_pair = unsafe { &*object.to_raw_address().to_ptr::<PairObject>() };
-                writer.write_all(b" ").map_err(|error| RuntimeError::io_like(error))?;
+                writer
+                    .write_all(b" ")
+                    .map_err(|error| RuntimeError::io_like(error))?;
                 return display_pair(writer, cdr_pair);
             }
-            writer.write_all(b" . ").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b" . ")
+                .map_err(|error| RuntimeError::io_like(error))?;
             write_value(writer, pair.cdr(), false)
         }
     }
@@ -183,14 +254,22 @@ fn write_pair(writer: &mut dyn Write, pair: &PairObject) -> Result<(), RuntimeEr
         Some(crate::value::Immediate::EmptyList) => Ok(()),
         _ => {
             if let Some(object) = pair.cdr().to_object_reference()
-                && unsafe { (*object.to_raw_address().to_ptr::<crate::layout::ObjectHeader>()).kind }
-                    == crate::layout::HEADER_TAG_PAIR
+                && unsafe {
+                    (*object
+                        .to_raw_address()
+                        .to_ptr::<crate::layout::ObjectHeader>())
+                    .kind
+                } == crate::layout::HEADER_TAG_PAIR
             {
                 let cdr_pair = unsafe { &*object.to_raw_address().to_ptr::<PairObject>() };
-                writer.write_all(b" ").map_err(|error| RuntimeError::io_like(error))?;
+                writer
+                    .write_all(b" ")
+                    .map_err(|error| RuntimeError::io_like(error))?;
                 return write_pair(writer, cdr_pair);
             }
-            writer.write_all(b" . ").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b" . ")
+                .map_err(|error| RuntimeError::io_like(error))?;
             write_value(writer, pair.cdr(), true)
         }
     }
@@ -204,11 +283,15 @@ fn write_scheme_value(writer: &mut dyn Write, value: Value) -> Result<(), Runtim
 
     match value.decode_immediate() {
         Some(crate::value::Immediate::Bool(true)) => {
-            writer.write_all(b"#t").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b"#t")
+                .map_err(|error| RuntimeError::io_like(error))?;
             return Ok(());
         }
         Some(crate::value::Immediate::Bool(false)) => {
-            writer.write_all(b"#f").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b"#f")
+                .map_err(|error| RuntimeError::io_like(error))?;
             return Ok(());
         }
         Some(crate::value::Immediate::Char(value)) => {
@@ -218,14 +301,18 @@ fn write_scheme_value(writer: &mut dyn Write, value: Value) -> Result<(), Runtim
                 value => {
                     let mut buffer = [0u8; 4];
                     let encoded = value.encode_utf8(&mut buffer);
-                    writer.write_all(b"#\\").and_then(|_| writer.write_all(encoded.as_bytes()))
+                    writer
+                        .write_all(b"#\\")
+                        .and_then(|_| writer.write_all(encoded.as_bytes()))
                 }
             }
             .map_err(|error| RuntimeError::io_like(error))?;
             return Ok(());
         }
         Some(crate::value::Immediate::EmptyList) => {
-            writer.write_all(b"()").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b"()")
+                .map_err(|error| RuntimeError::io_like(error))?;
             return Ok(());
         }
         Some(crate::value::Immediate::Unspecified) => {
@@ -243,9 +330,13 @@ fn write_scheme_value(writer: &mut dyn Write, value: Value) -> Result<(), Runtim
     match object_kind(value)? {
         crate::layout::HEADER_TAG_PAIR => {
             let pair = unsafe { &*object.to_raw_address().to_ptr::<PairObject>() };
-            writer.write_all(b"(").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b"(")
+                .map_err(|error| RuntimeError::io_like(error))?;
             write_pair(writer, pair)?;
-            writer.write_all(b")").map_err(|error| RuntimeError::io_like(error))?;
+            writer
+                .write_all(b")")
+                .map_err(|error| RuntimeError::io_like(error))?;
         }
         _ => write_value(writer, value, true)?,
     }
@@ -263,8 +354,12 @@ fn is_proper_list(mut value: Value) -> bool {
         let Some(object) = value.to_object_reference() else {
             return false;
         };
-        if unsafe { (*object.to_raw_address().to_ptr::<crate::layout::ObjectHeader>()).kind }
-            != crate::layout::HEADER_TAG_PAIR
+        if unsafe {
+            (*object
+                .to_raw_address()
+                .to_ptr::<crate::layout::ObjectHeader>())
+            .kind
+        } != crate::layout::HEADER_TAG_PAIR
         {
             return false;
         }
@@ -284,8 +379,12 @@ fn proper_list_length(mut value: Value) -> Result<usize, RuntimeError> {
         let object = value
             .to_object_reference()
             .ok_or(RuntimeError::InvalidObjectKind)?;
-        if unsafe { (*object.to_raw_address().to_ptr::<crate::layout::ObjectHeader>()).kind }
-            != crate::layout::HEADER_TAG_PAIR
+        if unsafe {
+            (*object
+                .to_raw_address()
+                .to_ptr::<crate::layout::ObjectHeader>())
+            .kind
+        } != crate::layout::HEADER_TAG_PAIR
         {
             return Err(RuntimeError::InvalidObjectKind);
         }
@@ -299,8 +398,12 @@ fn list_tail_value(mut value: Value, index: usize) -> Result<Value, RuntimeError
         let object = value
             .to_object_reference()
             .ok_or(RuntimeError::InvalidObjectKind)?;
-        if unsafe { (*object.to_raw_address().to_ptr::<crate::layout::ObjectHeader>()).kind }
-            != crate::layout::HEADER_TAG_PAIR
+        if unsafe {
+            (*object
+                .to_raw_address()
+                .to_ptr::<crate::layout::ObjectHeader>())
+            .kind
+        } != crate::layout::HEADER_TAG_PAIR
         {
             return Err(RuntimeError::InvalidObjectKind);
         }
@@ -314,8 +417,12 @@ fn list_ref_value(value: Value, index: usize) -> Result<Value, RuntimeError> {
     let object = tail
         .to_object_reference()
         .ok_or(RuntimeError::InvalidObjectKind)?;
-    if unsafe { (*object.to_raw_address().to_ptr::<crate::layout::ObjectHeader>()).kind }
-        != crate::layout::HEADER_TAG_PAIR
+    if unsafe {
+        (*object
+            .to_raw_address()
+            .to_ptr::<crate::layout::ObjectHeader>())
+        .kind
+    } != crate::layout::HEADER_TAG_PAIR
     {
         return Err(RuntimeError::InvalidObjectKind);
     }
@@ -340,8 +447,12 @@ fn append_two_lists(mut left: Value, right: Value) -> Result<Value, RuntimeError
         let object = left
             .to_object_reference()
             .ok_or(RuntimeError::InvalidObjectKind)?;
-        if unsafe { (*object.to_raw_address().to_ptr::<crate::layout::ObjectHeader>()).kind }
-            != crate::layout::HEADER_TAG_PAIR
+        if unsafe {
+            (*object
+                .to_raw_address()
+                .to_ptr::<crate::layout::ObjectHeader>())
+            .kind
+        } != crate::layout::HEADER_TAG_PAIR
         {
             return Err(RuntimeError::InvalidObjectKind);
         }
@@ -350,11 +461,113 @@ fn append_two_lists(mut left: Value, right: Value) -> Result<Value, RuntimeError
         left = pair.cdr();
     }
 
-    let mut result = right;
-    for element in elements.into_iter().rev() {
-        result = Value::from_object_reference(alloc_pair_checked(element, result)?);
+    let thread = current_thread();
+    let mut roots = RootGuard::new(thread);
+    for element in &mut elements {
+        roots.push(&mut element.0)?;
     }
-    Ok(result)
+
+    let mut result_bits = right.bits();
+    roots.push(&mut result_bits)?;
+    for index in (0..elements.len()).rev() {
+        let element = elements[index];
+        result_bits = Value::from_object_reference(alloc_pair_checked(
+            element,
+            Value::from_bits(result_bits),
+        )?)
+        .bits();
+    }
+    Ok(Value::from_bits(result_bits))
+}
+
+fn copy_list(mut value: Value) -> Result<Value, RuntimeError> {
+    let mut elements = Vec::new();
+    loop {
+        match value.decode_immediate() {
+            Some(crate::value::Immediate::EmptyList) => break,
+            Some(_) => return Err(RuntimeError::InvalidObjectKind),
+            None => {}
+        }
+
+        let object = value
+            .to_object_reference()
+            .ok_or(RuntimeError::InvalidObjectKind)?;
+        if unsafe {
+            (*object
+                .to_raw_address()
+                .to_ptr::<crate::layout::ObjectHeader>())
+            .kind
+        } != crate::layout::HEADER_TAG_PAIR
+        {
+            return Err(RuntimeError::InvalidObjectKind);
+        }
+        let pair = unsafe { &*object.to_raw_address().to_ptr::<PairObject>() };
+        elements.push(pair.car());
+        value = pair.cdr();
+    }
+
+    let thread = current_thread();
+    let mut roots = RootGuard::new(thread);
+    for element in &mut elements {
+        roots.push(&mut element.0)?;
+    }
+
+    let mut result_bits = Value::empty_list().bits();
+    roots.push(&mut result_bits)?;
+    for index in (0..elements.len()).rev() {
+        let element = elements[index];
+        result_bits = Value::from_object_reference(alloc_pair_checked(
+            element,
+            Value::from_bits(result_bits),
+        )?)
+        .bits();
+    }
+    Ok(Value::from_bits(result_bits))
+}
+
+fn reverse_list(mut value: Value) -> Result<Value, RuntimeError> {
+    let mut elements = Vec::new();
+    loop {
+        match value.decode_immediate() {
+            Some(crate::value::Immediate::EmptyList) => break,
+            Some(_) => return Err(RuntimeError::InvalidObjectKind),
+            None => {}
+        }
+
+        let object = value
+            .to_object_reference()
+            .ok_or(RuntimeError::InvalidObjectKind)?;
+        if unsafe {
+            (*object
+                .to_raw_address()
+                .to_ptr::<crate::layout::ObjectHeader>())
+            .kind
+        } != crate::layout::HEADER_TAG_PAIR
+        {
+            return Err(RuntimeError::InvalidObjectKind);
+        }
+        let pair = unsafe { &*object.to_raw_address().to_ptr::<PairObject>() };
+        elements.push(pair.car());
+        value = pair.cdr();
+    }
+
+    let thread = current_thread();
+    let mut roots = RootGuard::new(thread);
+    for element in &mut elements {
+        roots.push(&mut element.0)?;
+    }
+
+    let mut result_bits = Value::empty_list().bits();
+    roots.push(&mut result_bits)?;
+    for index in 0..elements.len() {
+        let element = elements[index];
+        result_bits = Value::from_object_reference(alloc_pair_checked(
+            element,
+            Value::from_bits(result_bits),
+        )?)
+        .bits();
+    }
+    Ok(Value::from_bits(result_bits))
 }
 
 #[unsafe(no_mangle)]
@@ -404,9 +617,9 @@ pub extern "C" fn rt_object_write_post(
     target: usize,
 ) {
     ffi_void(|| {
-        let Some(src) = mmtk::util::ObjectReference::from_raw_address(
-            mmtk::util::Address::from_mut_ptr(src),
-        ) else {
+        let Some(src) =
+            mmtk::util::ObjectReference::from_raw_address(mmtk::util::Address::from_mut_ptr(src))
+        else {
             return Ok(());
         };
         if slot.is_null() {
@@ -475,7 +688,9 @@ pub extern "C" fn mlisp_display(value: usize) -> usize {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
         display_value(&mut handle, Value::from_bits(value))?;
-        handle.flush().map_err(|error| RuntimeError::io_like(error))?;
+        handle
+            .flush()
+            .map_err(|error| RuntimeError::io_like(error))?;
         Ok(Value::unspecified().bits())
     })
 }
@@ -486,7 +701,9 @@ pub extern "C" fn mlisp_write(value: usize) -> usize {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
         write_scheme_value(&mut handle, Value::from_bits(value))?;
-        handle.flush().map_err(|error| RuntimeError::io_like(error))?;
+        handle
+            .flush()
+            .map_err(|error| RuntimeError::io_like(error))?;
         Ok(Value::unspecified().bits())
     })
 }
@@ -496,8 +713,12 @@ pub extern "C" fn mlisp_newline() -> usize {
     ffi_word(|| {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
-        handle.write_all(b"\n").map_err(|error| RuntimeError::io_like(error))?;
-        handle.flush().map_err(|error| RuntimeError::io_like(error))?;
+        handle
+            .write_all(b"\n")
+            .map_err(|error| RuntimeError::io_like(error))?;
+        handle
+            .flush()
+            .map_err(|error| RuntimeError::io_like(error))?;
         Ok(Value::unspecified().bits())
     })
 }
@@ -515,7 +736,9 @@ pub extern "C" fn mlisp_alloc_pair(car: usize, cdr: usize) -> usize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mlisp_alloc_box(value: usize) -> usize {
-    ffi_word(|| Ok(Value::from_object_reference(alloc_box_checked(Value::from_bits(value))?).bits()))
+    ffi_word(|| {
+        Ok(Value::from_object_reference(alloc_box_checked(Value::from_bits(value))?).bits())
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -550,7 +773,11 @@ pub unsafe extern "C" fn mlisp_box_set_gc(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mlisp_alloc_closure(code_ptr: usize, env_values: *const usize, env_len: usize) -> usize {
+pub unsafe extern "C" fn mlisp_alloc_closure(
+    code_ptr: usize,
+    env_values: *const usize,
+    env_len: usize,
+) -> usize {
     ffi_word(|| {
         if env_len != 0 && env_values.is_null() {
             return Err(RuntimeError::NullSlot);
@@ -560,7 +787,11 @@ pub unsafe extern "C" fn mlisp_alloc_closure(code_ptr: usize, env_values: *const
         } else {
             unsafe { core::slice::from_raw_parts(env_values, env_len) }
         };
-        let env = slice.iter().copied().map(Value::from_bits).collect::<Vec<_>>();
+        let env = slice
+            .iter()
+            .copied()
+            .map(Value::from_bits)
+            .collect::<Vec<_>>();
         Ok(Value::from_object_reference(alloc_closure_checked(code_ptr, &env)?).bits())
     })
 }
@@ -580,8 +811,14 @@ pub unsafe extern "C" fn mlisp_alloc_closure_gc(
         } else {
             unsafe { core::slice::from_raw_parts(env_values, env_len) }
         };
-        let env = slice.iter().copied().map(Value::from_bits).collect::<Vec<_>>();
-        Ok(alloc_closure_checked(code_ptr, &env)?.to_raw_address().to_mut_ptr())
+        let env = slice
+            .iter()
+            .copied()
+            .map(Value::from_bits)
+            .collect::<Vec<_>>();
+        Ok(alloc_closure_checked(code_ptr, &env)?
+            .to_raw_address()
+            .to_mut_ptr())
     })
 }
 
@@ -596,7 +833,10 @@ pub unsafe extern "C" fn mlisp_closure_code_ptr_gc(closure: *mut ClosureObject) 
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mlisp_closure_env_ref_gc(closure: *mut ClosureObject, index: usize) -> usize {
+pub unsafe extern "C" fn mlisp_closure_env_ref_gc(
+    closure: *mut ClosureObject,
+    index: usize,
+) -> usize {
     ffi_word(|| {
         if closure.is_null() {
             return Err(RuntimeError::InvalidObjectKind);
@@ -694,12 +934,16 @@ pub unsafe extern "C" fn mlisp_alloc_symbol_gc(bytes: *const u8, len: usize) -> 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mlisp_is_string(value: usize) -> bool {
-    ffi_bool(|| Ok(object_kind(Value::from_bits(value)).ok() == Some(crate::layout::HEADER_TAG_STRING)))
+    ffi_bool(|| {
+        Ok(object_kind(Value::from_bits(value)).ok() == Some(crate::layout::HEADER_TAG_STRING))
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mlisp_is_symbol(value: usize) -> bool {
-    ffi_bool(|| Ok(object_kind(Value::from_bits(value)).ok() == Some(crate::layout::HEADER_TAG_SYMBOL)))
+    ffi_bool(|| {
+        Ok(object_kind(Value::from_bits(value)).ok() == Some(crate::layout::HEADER_TAG_SYMBOL))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -781,13 +1025,20 @@ pub unsafe extern "C" fn mlisp_alloc_vector(values: *const usize, len: usize) ->
         } else {
             unsafe { core::slice::from_raw_parts(values, len) }
         };
-        let elements = slice.iter().copied().map(Value::from_bits).collect::<Vec<_>>();
+        let elements = slice
+            .iter()
+            .copied()
+            .map(Value::from_bits)
+            .collect::<Vec<_>>();
         Ok(Value::from_object_reference(alloc_vector_checked(&elements)?).bits())
     })
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mlisp_alloc_vector_gc(values: *const usize, len: usize) -> *mut VectorObject {
+pub unsafe extern "C" fn mlisp_alloc_vector_gc(
+    values: *const usize,
+    len: usize,
+) -> *mut VectorObject {
     ffi_ptr(|| {
         if len != 0 && values.is_null() {
             return Err(RuntimeError::NullSlot);
@@ -797,14 +1048,22 @@ pub unsafe extern "C" fn mlisp_alloc_vector_gc(values: *const usize, len: usize)
         } else {
             unsafe { core::slice::from_raw_parts(values, len) }
         };
-        let elements = slice.iter().copied().map(Value::from_bits).collect::<Vec<_>>();
-        Ok(alloc_vector_checked(&elements)?.to_raw_address().to_mut_ptr())
+        let elements = slice
+            .iter()
+            .copied()
+            .map(Value::from_bits)
+            .collect::<Vec<_>>();
+        Ok(alloc_vector_checked(&elements)?
+            .to_raw_address()
+            .to_mut_ptr())
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mlisp_is_vector(value: usize) -> bool {
-    ffi_bool(|| Ok(object_kind(Value::from_bits(value)).ok() == Some(crate::layout::HEADER_TAG_VECTOR)))
+    ffi_bool(|| {
+        Ok(object_kind(Value::from_bits(value)).ok() == Some(crate::layout::HEADER_TAG_VECTOR))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -882,7 +1141,11 @@ pub extern "C" fn mlisp_vector_set(value: usize, index: usize, element: usize) -
         if index >= vector.length {
             return Err(RuntimeError::IndexOutOfBounds);
         }
-        object_write_post_checked(object, unsafe { vector.elements_mut_ptr().add(index) }, Value::from_bits(element))?;
+        object_write_post_checked(
+            object,
+            unsafe { vector.elements_mut_ptr().add(index) },
+            Value::from_bits(element),
+        )?;
         Ok(Value::unspecified().bits())
     })
 }
@@ -917,9 +1180,11 @@ pub unsafe extern "C" fn mlisp_vector_set_gc(
 #[unsafe(no_mangle)]
 pub extern "C" fn mlisp_alloc_pair_gc(car: usize, cdr: usize) -> *mut PairObject {
     ffi_ptr(|| {
-        Ok(alloc_pair_checked(Value::from_bits(car), Value::from_bits(cdr))?
-            .to_raw_address()
-            .to_mut_ptr())
+        Ok(
+            alloc_pair_checked(Value::from_bits(car), Value::from_bits(cdr))?
+                .to_raw_address()
+                .to_mut_ptr(),
+        )
     })
 }
 
@@ -968,8 +1233,86 @@ pub unsafe extern "C" fn mlisp_pair_cdr_gc(pair: *mut PairObject) -> usize {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn mlisp_pair_set_car(value: usize, element: usize) -> usize {
+    ffi_word(|| {
+        let pair = Value::from_bits(value)
+            .to_object_reference()
+            .ok_or(RuntimeError::InvalidObjectKind)?;
+        if object_kind(Value::from_bits(value))? != crate::layout::HEADER_TAG_PAIR {
+            return Err(RuntimeError::InvalidObjectKind);
+        }
+        let pair_ptr = pair.to_raw_address().to_mut_ptr::<PairObject>();
+        object_write_post_checked(
+            pair,
+            unsafe { core::ptr::addr_of_mut!((*pair_ptr).car) },
+            Value::from_bits(element),
+        )?;
+        Ok(Value::unspecified().bits())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mlisp_pair_set_car_gc(pair: *mut PairObject, element: usize) -> usize {
+    ffi_word(|| {
+        if pair.is_null() {
+            return Err(RuntimeError::InvalidObjectKind);
+        }
+        let object = mmtk::util::ObjectReference::from_raw_address(
+            mmtk::util::Address::from_mut_ptr(pair),
+        )
+        .ok_or(RuntimeError::InvalidObjectKind)?;
+        object_write_post_checked(
+            object,
+            unsafe { core::ptr::addr_of_mut!((*pair).car) },
+            Value::from_bits(element),
+        )?;
+        Ok(Value::unspecified().bits())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mlisp_pair_set_cdr(value: usize, element: usize) -> usize {
+    ffi_word(|| {
+        let pair = Value::from_bits(value)
+            .to_object_reference()
+            .ok_or(RuntimeError::InvalidObjectKind)?;
+        if object_kind(Value::from_bits(value))? != crate::layout::HEADER_TAG_PAIR {
+            return Err(RuntimeError::InvalidObjectKind);
+        }
+        let pair_ptr = pair.to_raw_address().to_mut_ptr::<PairObject>();
+        object_write_post_checked(
+            pair,
+            unsafe { core::ptr::addr_of_mut!((*pair_ptr).cdr) },
+            Value::from_bits(element),
+        )?;
+        Ok(Value::unspecified().bits())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mlisp_pair_set_cdr_gc(pair: *mut PairObject, element: usize) -> usize {
+    ffi_word(|| {
+        if pair.is_null() {
+            return Err(RuntimeError::InvalidObjectKind);
+        }
+        let object = mmtk::util::ObjectReference::from_raw_address(
+            mmtk::util::Address::from_mut_ptr(pair),
+        )
+        .ok_or(RuntimeError::InvalidObjectKind)?;
+        object_write_post_checked(
+            object,
+            unsafe { core::ptr::addr_of_mut!((*pair).cdr) },
+            Value::from_bits(element),
+        )?;
+        Ok(Value::unspecified().bits())
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn mlisp_is_pair(value: usize) -> bool {
-    ffi_bool(|| Ok(object_kind(Value::from_bits(value)).ok() == Some(crate::layout::HEADER_TAG_PAIR)))
+    ffi_bool(|| {
+        Ok(object_kind(Value::from_bits(value)).ok() == Some(crate::layout::HEADER_TAG_PAIR))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1002,17 +1345,28 @@ pub extern "C" fn mlisp_append(left: usize, right: usize) -> usize {
     ffi_word(|| Ok(append_two_lists(Value::from_bits(left), Value::from_bits(right))?.bits()))
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn mlisp_list_copy(value: usize) -> usize {
+    ffi_word(|| Ok(copy_list(Value::from_bits(value))?.bits()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mlisp_reverse(value: usize) -> usize {
+    ffi_word(|| Ok(reverse_list(Value::from_bits(value))?.bits()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         mlisp_alloc_pair, mlisp_alloc_pair_gc, mlisp_alloc_string, mlisp_alloc_string_gc,
         mlisp_alloc_vector, mlisp_alloc_vector_gc, mlisp_append, mlisp_is_list, mlisp_is_pair,
-        mlisp_is_string, mlisp_is_symbol, mlisp_is_vector, mlisp_list_length, mlisp_list_ref,
-        mlisp_list_tail, mlisp_make_fixnum, mlisp_pair_car, mlisp_pair_car_gc, mlisp_pair_cdr,
-        mlisp_pair_cdr_gc, mlisp_string_length, mlisp_string_length_gc, mlisp_string_ref,
-        mlisp_string_ref_gc, mlisp_vector_length, mlisp_vector_length_gc, mlisp_vector_ref,
-        mlisp_vector_ref_gc, mlisp_vector_set, mlisp_vector_set_gc, rt_bind_thread, rt_gc_poll,
-        rt_mmtk_init, rt_run_mutator_stress, rt_unbind_thread,
+        mlisp_is_string, mlisp_is_symbol, mlisp_is_vector, mlisp_list_copy, mlisp_list_length,
+        mlisp_list_ref, mlisp_list_tail, mlisp_make_fixnum, mlisp_pair_car, mlisp_pair_car_gc,
+        mlisp_pair_cdr, mlisp_pair_cdr_gc, mlisp_pair_set_car, mlisp_pair_set_cdr, mlisp_reverse,
+        mlisp_string_length, mlisp_string_length_gc, mlisp_string_ref, mlisp_string_ref_gc,
+        mlisp_vector_length, mlisp_vector_length_gc, mlisp_vector_ref, mlisp_vector_ref_gc,
+        mlisp_vector_set, mlisp_vector_set_gc, rt_bind_thread, rt_gc_poll, rt_mmtk_init,
+        rt_run_mutator_stress, rt_unbind_thread,
     };
     use crate::value::Value;
 
@@ -1041,13 +1395,16 @@ mod tests {
         assert!(mlisp_is_list(empty));
         assert!(mlisp_is_list(list));
         assert!(!mlisp_is_list(dotted));
-        assert_eq!(Value::from_bits(mlisp_list_length(list)).decode_fixnum(), Some(2));
-        assert_eq!(Value::from_bits(mlisp_list_ref(list, 1)).decode_fixnum(), Some(2));
-        assert!(mlisp_is_list(mlisp_list_tail(list, 1)));
         assert_eq!(
-            mlisp_list_length(dotted),
-            Value::unspecified().bits()
+            Value::from_bits(mlisp_list_length(list)).decode_fixnum(),
+            Some(2)
         );
+        assert_eq!(
+            Value::from_bits(mlisp_list_ref(list, 1)).decode_fixnum(),
+            Some(2)
+        );
+        assert!(mlisp_is_list(mlisp_list_tail(list, 1)));
+        assert_eq!(mlisp_list_length(dotted), Value::unspecified().bits());
         unsafe { rt_unbind_thread(thread) };
     }
 
@@ -1075,7 +1432,10 @@ mod tests {
         let thread = rt_bind_thread();
         let value = unsafe { mlisp_alloc_string(b"hello".as_ptr(), 5) };
         assert!(mlisp_is_string(value));
-        assert_eq!(Value::from_bits(mlisp_string_length(value)).decode_fixnum(), Some(5));
+        assert_eq!(
+            Value::from_bits(mlisp_string_length(value)).decode_fixnum(),
+            Some(5)
+        );
         assert_eq!(
             Value::from_bits(mlisp_string_ref(value, 1)).decode_fixnum(),
             Some(b'e' as i64)
@@ -1093,7 +1453,10 @@ mod tests {
         assert!(rt_mmtk_init(8 * 1024 * 1024, 1));
         let thread = rt_bind_thread();
         let string = unsafe { mlisp_alloc_string_gc(b"hi".as_ptr(), 2) };
-        assert_eq!(Value::from_bits(unsafe { mlisp_string_length_gc(string) }).decode_fixnum(), Some(2));
+        assert_eq!(
+            Value::from_bits(unsafe { mlisp_string_length_gc(string) }).decode_fixnum(),
+            Some(2)
+        );
         assert_eq!(
             Value::from_bits(unsafe { mlisp_string_ref_gc(string, 1) }).decode_fixnum(),
             Some(b'i' as i64)
@@ -1121,8 +1484,49 @@ mod tests {
         let right = mlisp_alloc_pair(mlisp_make_fixnum(3), empty);
         let appended = mlisp_append(left, right);
         assert!(mlisp_is_list(appended));
-        assert_eq!(Value::from_bits(mlisp_list_length(appended)).decode_fixnum(), Some(3));
-        assert_eq!(Value::from_bits(mlisp_list_ref(appended, 2)).decode_fixnum(), Some(3));
+        assert_eq!(
+            Value::from_bits(mlisp_list_length(appended)).decode_fixnum(),
+            Some(3)
+        );
+        assert_eq!(
+            Value::from_bits(mlisp_list_ref(appended, 2)).decode_fixnum(),
+            Some(3)
+        );
+        unsafe { rt_unbind_thread(thread) };
+    }
+
+    #[test]
+    fn mutates_and_copies_lists_through_runtime() {
+        assert!(rt_mmtk_init(8 * 1024 * 1024, 1));
+        let thread = rt_bind_thread();
+        let empty = Value::empty_list().bits();
+        let tail = mlisp_alloc_pair(mlisp_make_fixnum(2), empty);
+        let pair = mlisp_alloc_pair(mlisp_make_fixnum(1), tail);
+        let mut rooted_pair = pair;
+        super::push_root_checked(thread, &mut rooted_pair).unwrap();
+        assert_eq!(
+            mlisp_pair_set_car(rooted_pair, mlisp_make_fixnum(9)),
+            Value::unspecified().bits()
+        );
+        assert_eq!(mlisp_pair_set_cdr(rooted_pair, empty), Value::unspecified().bits());
+        assert!(mlisp_is_pair(rooted_pair));
+        assert_eq!(
+            Value::from_bits(unsafe { mlisp_pair_car(rooted_pair) }).decode_fixnum(),
+            Some(9)
+        );
+        assert_eq!(unsafe { mlisp_pair_cdr(rooted_pair) }, empty);
+
+        let copied = mlisp_list_copy(mlisp_append(rooted_pair, tail));
+        let reversed = mlisp_reverse(copied);
+        assert_eq!(
+            Value::from_bits(mlisp_list_ref(reversed, 0)).decode_fixnum(),
+            Some(2)
+        );
+        assert_eq!(
+            Value::from_bits(mlisp_list_ref(reversed, 1)).decode_fixnum(),
+            Some(9)
+        );
+        super::pop_root_checked(thread).unwrap();
         unsafe { rt_unbind_thread(thread) };
     }
 
@@ -1134,12 +1538,21 @@ mod tests {
         let elements = [mlisp_make_fixnum(7), string];
         let vector = unsafe { mlisp_alloc_vector(elements.as_ptr(), elements.len()) };
         assert!(mlisp_is_vector(vector));
-        assert_eq!(Value::from_bits(mlisp_vector_length(vector)).decode_fixnum(), Some(2));
-        assert_eq!(Value::from_bits(mlisp_vector_ref(vector, 0)).decode_fixnum(), Some(7));
+        assert_eq!(
+            Value::from_bits(mlisp_vector_length(vector)).decode_fixnum(),
+            Some(2)
+        );
+        assert_eq!(
+            Value::from_bits(mlisp_vector_ref(vector, 0)).decode_fixnum(),
+            Some(7)
+        );
         assert_eq!(mlisp_vector_ref(vector, 1), string);
 
         let replacement = mlisp_alloc_pair(mlisp_make_fixnum(1), mlisp_make_fixnum(2));
-        assert_eq!(mlisp_vector_set(vector, 1, replacement), Value::unspecified().bits());
+        assert_eq!(
+            mlisp_vector_set(vector, 1, replacement),
+            Value::unspecified().bits()
+        );
         rt_gc_poll();
         assert_eq!(mlisp_vector_ref(vector, 1), replacement);
         unsafe { rt_unbind_thread(thread) };
@@ -1176,7 +1589,10 @@ mod tests {
             unsafe { mlisp_pair_car(mlisp_make_fixnum(1)) },
             Value::unspecified().bits()
         );
-        assert_eq!(unsafe { mlisp_pair_car_gc(core::ptr::null_mut()) }, Value::unspecified().bits());
+        assert_eq!(
+            unsafe { mlisp_pair_car_gc(core::ptr::null_mut()) },
+            Value::unspecified().bits()
+        );
         unsafe { rt_unbind_thread(core::ptr::null_mut()) };
     }
 }

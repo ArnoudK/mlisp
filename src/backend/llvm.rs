@@ -10,7 +10,7 @@ use crate::backend::runtime::RuntimeAbi;
 use crate::backend::statepoint::{attach_gc_strategy, gc_ptr_type};
 use crate::error::CompileError;
 use crate::middle::hir::Datum;
-use crate::middle::hir::{Binding, Expr, ExprKind, Program, TopLevel};
+use crate::middle::hir::{Binding, Expr, ExprKind, Formals, Program, TopLevel};
 use crate::runtime::layout::{BOOL_FALSE, BOOL_TRUE, EMPTY_LIST, FIXNUM_SHIFT, FIXNUM_TAG};
 use crate::runtime::value::Value;
 
@@ -50,7 +50,8 @@ struct ClosureInfo<'ctx> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FunctionSignature {
     return_kind: AbiValueKind,
-    param_kinds: &'static [AbiValueKind],
+    required_param_kinds: &'static [AbiValueKind],
+    rest: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -68,6 +69,9 @@ enum CaptureKind {
 #[derive(Clone, Copy)]
 enum CodegenValue<'ctx> {
     Word(IntValue<'ctx>),
+    RootedWord {
+        slot: PointerValue<'ctx>,
+    },
     HeapObject {
         ptr: PointerValue<'ctx>,
         kind: HeapValueKind,
@@ -98,6 +102,7 @@ struct Compiler<'ctx> {
     runtime: RuntimeAbi<'ctx>,
     functions: HashMap<String, FunctionInfo<'ctx>>,
     mutable_top_level_names: std::collections::HashSet<String>,
+    pair_mutated_top_level_names: std::collections::HashSet<String>,
     lambda_counter: usize,
 }
 
@@ -111,12 +116,14 @@ impl<'ctx> Compiler<'ctx> {
             runtime,
             functions: HashMap::new(),
             mutable_top_level_names: std::collections::HashSet::new(),
+            pair_mutated_top_level_names: std::collections::HashSet::new(),
             lambda_counter: 0,
         }
     }
 
     fn compile_program(&mut self, program: &Program) -> Result<CompiledModule, CompileError> {
         self.mutable_top_level_names = self.collect_program_mutations(program);
+        self.pair_mutated_top_level_names = self.collect_program_pair_mutations(program);
         self.declare_top_level_procedures(program)?;
         self.compile_top_level_procedures(program)?;
 
@@ -131,6 +138,7 @@ impl<'ctx> Compiler<'ctx> {
 
         let mut env = HashMap::new();
         let mut last_value = CodegenValue::Word(self.const_fixnum(0));
+        let mut rooted_top_level_count = 0usize;
 
         for item in &program.items {
             match item {
@@ -138,6 +146,13 @@ impl<'ctx> Compiler<'ctx> {
                     let compiled = self.compile_expr(&builder, main, &env, value)?;
                     let stored = if self.mutable_top_level_names.contains(name) {
                         self.box_value(&builder, compiled, &format!("top.level.{name}.box"))?
+                    } else if self.pair_mutated_top_level_names.contains(name) {
+                        rooted_top_level_count += 1;
+                        self.root_word(
+                            &builder,
+                            self.value_to_word(&builder, compiled, &format!("top.level.{name}.word"))?,
+                            &format!("top.level.{name}.root"),
+                        )?
                     } else {
                         compiled
                     };
@@ -152,6 +167,7 @@ impl<'ctx> Compiler<'ctx> {
         }
 
         let return_value = self.value_to_word(&builder, last_value, "top.level.return")?;
+        self.pop_root_slots(&builder, rooted_top_level_count)?;
         builder
             .build_return(Some(&return_value))
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -187,7 +203,7 @@ impl<'ctx> Compiler<'ctx> {
                 let signature = function_signatures
                     .get(&procedure.name)
                     .copied()
-                    .unwrap_or_else(|| self.default_signature(procedure.params.len()));
+                    .unwrap_or_else(|| self.default_signature(&procedure.formals));
                 let function = self.module.add_function(
                     &procedure.name,
                     self.function_type(signature),
@@ -214,7 +230,7 @@ impl<'ctx> Compiler<'ctx> {
                 })?;
                 self.compile_function_body(
                     function,
-                    &procedure.params,
+                    &procedure.formals,
                     &procedure.body,
                     &HashMap::new(),
                 )?;
@@ -226,7 +242,7 @@ impl<'ctx> Compiler<'ctx> {
     fn compile_function_body(
         &mut self,
         function: FunctionInfo<'ctx>,
-        params: &[String],
+        formals: &Formals,
         body: &Expr,
         outer_env: &HashMap<String, CodegenValue<'ctx>>,
     ) -> Result<(), CompileError> {
@@ -239,8 +255,11 @@ impl<'ctx> Compiler<'ctx> {
         builder.position_at_end(entry);
 
         let mut env = outer_env.clone();
-        let mutated_names = self.collect_mutated_names_with_initial(body, params.iter().cloned());
-        for (index, param_name) in params.iter().enumerate() {
+        let formal_names = formals.all_names();
+        let mutated_names = self.collect_mutated_names_with_initial(body, formal_names.clone());
+        let pair_mutated_names = self.collect_pair_mutated_names_with_initial(body, formal_names);
+        let mut rooted_param_count = 0usize;
+        for (index, param_name) in formals.required.iter().enumerate() {
             let param = function
                 .value
                 .get_nth_param(index as u32)
@@ -252,7 +271,7 @@ impl<'ctx> Compiler<'ctx> {
                 })?;
             let value = match function
                 .signature
-                .param_kinds
+                .required_param_kinds
                 .get(index)
                 .copied()
                 .unwrap_or(AbiValueKind::Word)
@@ -265,22 +284,54 @@ impl<'ctx> Compiler<'ctx> {
             };
             let stored = if mutated_names.contains(param_name) {
                 self.box_value(&builder, value, &format!("param.{param_name}.box"))?
+            } else if pair_mutated_names.contains(param_name) {
+                rooted_param_count += 1;
+                self.root_word(
+                    &builder,
+                    self.value_to_word(&builder, value, &format!("param.{param_name}.word"))?,
+                    &format!("param.{param_name}.root"),
+                )?
             } else {
                 value
             };
             env.insert(param_name.clone(), stored);
+        }
+        if let Some(rest_name) = &formals.rest {
+            let index = formals.required.len();
+            let param = function.value.get_nth_param(index as u32).ok_or_else(|| {
+                CompileError::Codegen(format!(
+                    "missing rest parameter for function '{}'",
+                    function.value.get_name().to_str().unwrap_or("<lambda>")
+                ))
+            })?;
+            let value = CodegenValue::Word(param.into_int_value());
+            let stored = if mutated_names.contains(rest_name) {
+                self.box_value(&builder, value, &format!("param.{rest_name}.box"))?
+            } else if pair_mutated_names.contains(rest_name) {
+                rooted_param_count += 1;
+                self.root_word(
+                    &builder,
+                    self.value_to_word(&builder, value, &format!("param.{rest_name}.word"))?,
+                    &format!("param.{rest_name}.root"),
+                )?
+            } else {
+                value
+            };
+            env.insert(rest_name.clone(), stored);
         }
 
         let body_value = self.compile_expr(&builder, function.value, &env, body)?;
         match function.signature.return_kind {
             AbiValueKind::Word => {
                 let return_value = self.value_to_word(&builder, body_value, "procedure.return")?;
+                self.pop_root_slots(&builder, rooted_param_count)?;
                 builder
                     .build_return(Some(&return_value))
                     .map_err(|error| CompileError::Codegen(error.to_string()))?;
             }
             AbiValueKind::Heap(kind) => {
                 let return_value = self.expect_heap_object(body_value, kind, "procedure.return")?;
+                self.pop_root_slots(&builder, rooted_param_count)?;
                 builder
                     .build_return(Some(&return_value))
                     .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -318,6 +369,9 @@ impl<'ctx> Compiler<'ctx> {
                 Some(CodegenValue::MutableBox { ptr }) => Ok(CodegenValue::Word(
                     self.load_box_word(builder, ptr, &format!("{name}.load"))?,
                 )),
+                Some(CodegenValue::RootedWord { slot }) => Ok(CodegenValue::Word(
+                    self.load_rooted_word(builder, slot, &format!("{name}.root.load"))?,
+                )),
                 Some(value) => Ok(value),
                 None => self
                     .functions
@@ -335,14 +389,18 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(last)
             }
             ExprKind::Let { bindings, body } => {
-                let scoped =
+                let (scoped, rooted_count) =
                     self.compile_parallel_bindings(builder, current_function, env, bindings, body)?;
-                self.compile_expr(builder, current_function, &scoped, body)
+                let result = self.compile_expr(builder, current_function, &scoped, body)?;
+                self.pop_root_slots(builder, rooted_count)?;
+                Ok(result)
             }
             ExprKind::LetStar { bindings, body } => {
-                let scoped =
+                let (scoped, rooted_count) =
                     self.compile_sequential_bindings(builder, current_function, env, bindings, body)?;
-                self.compile_expr(builder, current_function, &scoped, body)
+                let result = self.compile_expr(builder, current_function, &scoped, body)?;
+                self.pop_root_slots(builder, rooted_count)?;
+                Ok(result)
             }
             ExprKind::LetRec { bindings, body } => {
                 let scoped = self.compile_recursive_bindings(builder, current_function, env, bindings)?;
@@ -415,7 +473,9 @@ impl<'ctx> Compiler<'ctx> {
             ExprKind::Call { callee, args } => {
                 self.compile_call(builder, current_function, env, callee, args)
             }
-            ExprKind::Lambda { params, body } => self.compile_lambda(builder, env, params, body),
+            ExprKind::Lambda { formals, body } => {
+                self.compile_lambda(builder, env, formals, body)
+            }
             ExprKind::Quote(datum) => self.compile_quote(builder, datum),
         }
     }
@@ -438,23 +498,29 @@ impl<'ctx> Compiler<'ctx> {
         let signature = match callee_value {
             CodegenValue::Function(info) => info.signature,
             CodegenValue::Closure(info) => info.signature,
-            CodegenValue::Word(_) | CodegenValue::HeapObject { .. } | CodegenValue::MutableBox { .. } => {
+            CodegenValue::Word(_)
+            | CodegenValue::RootedWord { .. }
+            | CodegenValue::HeapObject { .. }
+            | CodegenValue::MutableBox { .. } => {
                 return Err(CompileError::Codegen(
                     "call target expected a function value, but a non-function was produced"
                         .into(),
                 ));
             }
         };
-        if signature.param_kinds.len() != args.len() {
+        if args.len() < signature.required_param_kinds.len()
+            || (!signature.rest && args.len() != signature.required_param_kinds.len())
+        {
             return Err(CompileError::Codegen(format!(
-                "procedure expects {} arguments but got {}",
-                signature.param_kinds.len(),
+                "procedure expects {}{} arguments but got {}",
+                signature.required_param_kinds.len(),
+                if signature.rest { " or more" } else { "" },
                 args.len()
             )));
         }
-        let compiled_args = args
+        let mut compiled_args = args
             .iter()
-            .zip(signature.param_kinds.iter())
+            .zip(signature.required_param_kinds.iter())
             .map(|(expr, kind)| {
                 let value = self.compile_expr(builder, current_function, env, expr)?;
                 match kind {
@@ -467,14 +533,24 @@ impl<'ctx> Compiler<'ctx> {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if signature.rest {
+            let rest_list = self.build_list_value(
+                builder,
+                current_function,
+                env,
+                &args[signature.required_param_kinds.len()..],
+                "call.rest",
+            )?;
+            compiled_args.push(rest_list.into());
+        }
 
         match callee_value {
             CodegenValue::Function(target) => {
-                if target.value.count_params() as usize != args.len() {
+                if target.value.count_params() as usize != compiled_args.len() {
                     return Err(CompileError::Codegen(format!(
                         "procedure expects {} arguments but got {}",
                         target.value.count_params(),
-                        args.len()
+                        compiled_args.len()
                     )));
                 }
                 let call = builder
@@ -512,7 +588,10 @@ impl<'ctx> Compiler<'ctx> {
                     .ok_or_else(|| CompileError::Codegen("call did not return a value".into()))?;
                 self.wrap_call_result(signature.return_kind, result)
             }
-            CodegenValue::Word(_) | CodegenValue::HeapObject { .. } | CodegenValue::MutableBox { .. } => {
+            CodegenValue::Word(_)
+            | CodegenValue::RootedWord { .. }
+            | CodegenValue::HeapObject { .. }
+            | CodegenValue::MutableBox { .. } => {
                 unreachable!()
             }
         }
@@ -541,9 +620,13 @@ impl<'ctx> Compiler<'ctx> {
             }
             "list" => self.compile_list(builder, current_function, env, args),
             "append" => self.compile_append(builder, current_function, env, args),
+            "list-copy" => self.compile_list_copy(builder, current_function, env, args),
+            "reverse" => self.compile_reverse(builder, current_function, env, args),
             "cons" => self.compile_cons(builder, current_function, env, args),
             "car" => self.compile_pair_access(builder, current_function, env, args, true),
             "cdr" => self.compile_pair_access(builder, current_function, env, args, false),
+            "set-car!" => self.compile_pair_set(builder, current_function, env, args, true),
+            "set-cdr!" => self.compile_pair_set(builder, current_function, env, args, false),
             "pair?" => self.compile_pair_predicate(builder, current_function, env, args),
             "list?" => self.compile_list_predicate(builder, current_function, env, args),
             "length" => self.compile_list_length(builder, current_function, env, args),
@@ -759,6 +842,7 @@ impl<'ctx> Compiler<'ctx> {
         let value = self.compile_expr(builder, current_function, env, &args[0])?;
         let result = match value {
             CodegenValue::HeapObject { .. }
+            | CodegenValue::RootedWord { .. }
             | CodegenValue::MutableBox { .. }
             | CodegenValue::Function(_)
             | CodegenValue::Closure(_) => self.context.bool_type().const_zero(),
@@ -892,6 +976,7 @@ impl<'ctx> Compiler<'ctx> {
                 ..
             } => self.context.bool_type().const_int(1, false),
             CodegenValue::HeapObject { .. }
+            | CodegenValue::RootedWord { .. }
             | CodegenValue::MutableBox { .. }
             | CodegenValue::Function(_)
             | CodegenValue::Closure(_) => self.context.bool_type().const_zero(),
@@ -935,6 +1020,7 @@ impl<'ctx> Compiler<'ctx> {
         let is_procedure = match value {
             CodegenValue::Function(_) | CodegenValue::Closure(_) => true,
             CodegenValue::Word(_)
+            | CodegenValue::RootedWord { .. }
             | CodegenValue::HeapObject { .. }
             | CodegenValue::MutableBox { .. } => false,
         };
@@ -983,14 +1069,9 @@ impl<'ctx> Compiler<'ctx> {
             let car = self.compile_expr(builder, current_function, env, arg)?;
             let car_word = self.value_to_word(builder, car, "list.car")?;
             let cdr_word = self.value_to_word(builder, result, "list.cdr")?;
-            let pair = builder
-                .build_call(self.runtime.alloc_pair_gc, &[car_word.into(), cdr_word.into()], "list.cons")
-                .map_err(|error| CompileError::Codegen(error.to_string()))?
-                .try_as_basic_value()
-                .basic()
-                .ok_or_else(|| CompileError::Codegen("list allocation did not return a value".into()))?;
+            let pair = self.alloc_pair_rooted(builder, car_word, cdr_word, "list.cons")?;
             result = CodegenValue::HeapObject {
-                ptr: pair.into_pointer_value(),
+                ptr: pair,
                 kind: HeapValueKind::Pair,
             };
         }
@@ -1028,6 +1109,48 @@ impl<'ctx> Compiler<'ctx> {
         }
 
         Ok(result)
+    }
+
+    fn compile_list_copy(
+        &mut self,
+        builder: &Builder<'ctx>,
+        current_function: FunctionValue<'ctx>,
+        env: &HashMap<String, CodegenValue<'ctx>>,
+        args: &[Expr],
+    ) -> Result<CodegenValue<'ctx>, CompileError> {
+        if args.len() != 1 {
+            return Err(CompileError::Codegen("list-copy expects exactly one argument".into()));
+        }
+        let value = self.compile_expr(builder, current_function, env, &args[0])?;
+        let word = self.value_to_word(builder, value, "list-copy argument")?;
+        let result = builder
+            .build_call(self.runtime.list_copy, &[word.into()], "list_copy")
+            .map_err(|error| CompileError::Codegen(error.to_string()))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CompileError::Codegen("list-copy did not return a value".into()))?;
+        Ok(CodegenValue::Word(result.into_int_value()))
+    }
+
+    fn compile_reverse(
+        &mut self,
+        builder: &Builder<'ctx>,
+        current_function: FunctionValue<'ctx>,
+        env: &HashMap<String, CodegenValue<'ctx>>,
+        args: &[Expr],
+    ) -> Result<CodegenValue<'ctx>, CompileError> {
+        if args.len() != 1 {
+            return Err(CompileError::Codegen("reverse expects exactly one argument".into()));
+        }
+        let value = self.compile_expr(builder, current_function, env, &args[0])?;
+        let word = self.value_to_word(builder, value, "reverse argument")?;
+        let result = builder
+            .build_call(self.runtime.reverse, &[word.into()], "reverse")
+            .map_err(|error| CompileError::Codegen(error.to_string()))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CompileError::Codegen("reverse did not return a value".into()))?;
+        Ok(CodegenValue::Word(result.into_int_value()))
     }
 
     fn compile_set(
@@ -1076,19 +1199,8 @@ impl<'ctx> Compiler<'ctx> {
         let car = self.value_to_word(builder, car_value, "cons.car")?;
         let cdr_value = self.compile_expr(builder, current_function, env, &args[1])?;
         let cdr = self.value_to_word(builder, cdr_value, "cons.cdr")?;
-        let call = builder
-            .build_call(
-                self.runtime.alloc_pair_gc,
-                &[car.into(), cdr.into()],
-                "cons.raw",
-            )
-            .map_err(|error| CompileError::Codegen(error.to_string()))?;
-        let result = call
-            .try_as_basic_value()
-            .basic()
-            .ok_or_else(|| CompileError::Codegen("cons did not return a value".into()))?;
         Ok(CodegenValue::HeapObject {
-            ptr: result.into_pointer_value(),
+            ptr: self.alloc_pair_rooted(builder, car, cdr, "cons.raw")?,
             kind: HeapValueKind::Pair,
         })
     }
@@ -1146,6 +1258,89 @@ impl<'ctx> Compiler<'ctx> {
                     .ok_or_else(|| {
                         CompileError::Codegen("pair access did not return a value".into())
                     })?
+            }
+        };
+        Ok(CodegenValue::Word(result.into_int_value()))
+    }
+
+    fn compile_pair_set(
+        &mut self,
+        builder: &Builder<'ctx>,
+        current_function: FunctionValue<'ctx>,
+        env: &HashMap<String, CodegenValue<'ctx>>,
+        args: &[Expr],
+        set_car: bool,
+    ) -> Result<CodegenValue<'ctx>, CompileError> {
+        if args.len() != 2 {
+            return Err(CompileError::Codegen(format!(
+                "{} expects exactly two arguments",
+                if set_car { "set-car!" } else { "set-cdr!" }
+            )));
+        }
+        let pair = if let ExprKind::Variable(name) = &args[0].kind {
+            env.get(name)
+                .copied()
+                .map(Ok)
+                .unwrap_or_else(|| self.compile_expr(builder, current_function, env, &args[0]))?
+        } else {
+            self.compile_expr(builder, current_function, env, &args[0])?
+        };
+        let value = self.compile_expr(builder, current_function, env, &args[1])?;
+        let value_word = self.value_to_word(builder, value, "pair-set value")?;
+        let result = match pair {
+            CodegenValue::HeapObject {
+                ptr,
+                kind: HeapValueKind::Pair,
+            } => builder
+                .build_call(
+                    if set_car {
+                        self.runtime.pair_set_car_gc
+                    } else {
+                        self.runtime.pair_set_cdr_gc
+                    },
+                    &[ptr.into(), value_word.into()],
+                    "pair_set_gc",
+                )
+                .map_err(|error| CompileError::Codegen(error.to_string()))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| CompileError::Codegen("pair mutation did not return a value".into()))?,
+            CodegenValue::RootedWord { slot } => {
+                let pair_word = self.load_rooted_word(builder, slot, "pair_set.rooted")?;
+                let pair_ptr = builder
+                    .build_int_to_ptr(pair_word, gc_ptr_type(self.context), "pair_set.rooted.ptr")
+                    .map_err(|error| CompileError::Codegen(error.to_string()))?;
+                builder
+                    .build_call(
+                        if set_car {
+                            self.runtime.pair_set_car_gc
+                        } else {
+                            self.runtime.pair_set_cdr_gc
+                        },
+                        &[pair_ptr.into(), value_word.into()],
+                        "pair_set_gc",
+                    )
+                    .map_err(|error| CompileError::Codegen(error.to_string()))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| CompileError::Codegen("pair mutation did not return a value".into()))?
+            }
+            other => {
+                let pair_word = self.value_to_word(builder, other, "pair-set target")?;
+                builder
+                    .build_call(
+                        if set_car {
+                            self.runtime.pair_set_car
+                        } else {
+                            self.runtime.pair_set_cdr
+                        },
+                        &[pair_word.into(), value_word.into()],
+                        "pair_set",
+                    )
+                    .map_err(|error| CompileError::Codegen(error.to_string()))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| CompileError::Codegen("pair mutation did not return a value".into()))?
             }
         };
         Ok(CodegenValue::Word(result.into_int_value()))
@@ -1819,23 +2014,20 @@ impl<'ctx> Compiler<'ctx> {
             )),
             Datum::String(value) => self.compile_string_literal(builder, value),
             Datum::Symbol(value) => self.compile_symbol_literal(builder, value),
-            Datum::List(items) if items.is_empty() => Ok(CodegenValue::Word(
-                self.word_type().const_int(EMPTY_LIST as u64, false),
-            )),
-            Datum::List(items) => {
-                let mut result = CodegenValue::Word(self.word_type().const_int(EMPTY_LIST as u64, false));
+            Datum::List { items, tail } if items.is_empty() && tail.is_none() => {
+                Ok(CodegenValue::Word(self.word_type().const_int(EMPTY_LIST as u64, false)))
+            }
+            Datum::List { items, tail } => {
+                let mut result = match tail {
+                    Some(tail) => self.compile_quote(builder, tail)?,
+                    None => CodegenValue::Word(self.word_type().const_int(EMPTY_LIST as u64, false)),
+                };
                 for item in items.iter().rev() {
                     let car = self.compile_quote(builder, item)?;
                     let car_word = self.value_to_word(builder, car, "quoted list car")?;
                     let cdr_word = self.value_to_word(builder, result, "quoted list cdr")?;
-                    let pair = builder
-                        .build_call(self.runtime.alloc_pair_gc, &[car_word.into(), cdr_word.into()], "quote.cons")
-                        .map_err(|error| CompileError::Codegen(error.to_string()))?
-                        .try_as_basic_value()
-                        .basic()
-                        .ok_or_else(|| CompileError::Codegen("quoted pair allocation did not return a value".into()))?;
                     result = CodegenValue::HeapObject {
-                        ptr: pair.into_pointer_value(),
+                        ptr: self.alloc_pair_rooted(builder, car_word, cdr_word, "quote.cons")?,
                         kind: HeapValueKind::Pair,
                     };
                 }
@@ -1851,16 +2043,28 @@ impl<'ctx> Compiler<'ctx> {
         env: &HashMap<String, CodegenValue<'ctx>>,
         bindings: &[Binding],
         body: &Expr,
-    ) -> Result<HashMap<String, CodegenValue<'ctx>>, CompileError> {
+    ) -> Result<(HashMap<String, CodegenValue<'ctx>>, usize), CompileError> {
         let mutables = self.collect_mutated_names_with_initial(
             body,
             bindings.iter().map(|binding| binding.name.clone()),
         );
+        let pair_mutated = self.collect_pair_mutated_names_with_initial(
+            body,
+            bindings.iter().map(|binding| binding.name.clone()),
+        );
         let mut bound = Vec::with_capacity(bindings.len());
+        let mut rooted_count = 0usize;
         for binding in bindings {
             let value = self.compile_expr(builder, current_function, env, &binding.value)?;
             let stored = if mutables.contains(&binding.name) {
                 self.box_value(builder, value, &format!("let.{}.box", binding.name))?
+            } else if pair_mutated.contains(&binding.name) {
+                rooted_count += 1;
+                self.root_word(
+                    builder,
+                    self.value_to_word(builder, value, &format!("let.{}.word", binding.name))?,
+                    &format!("let.{}.root", binding.name),
+                )?
             } else {
                 value
             };
@@ -1869,7 +2073,7 @@ impl<'ctx> Compiler<'ctx> {
 
         let mut scoped = env.clone();
         scoped.extend(bound);
-        Ok(scoped)
+        Ok((scoped, rooted_count))
     }
 
     fn compile_sequential_bindings(
@@ -1879,22 +2083,34 @@ impl<'ctx> Compiler<'ctx> {
         env: &HashMap<String, CodegenValue<'ctx>>,
         bindings: &[Binding],
         body: &Expr,
-    ) -> Result<HashMap<String, CodegenValue<'ctx>>, CompileError> {
+    ) -> Result<(HashMap<String, CodegenValue<'ctx>>, usize), CompileError> {
         let mutables = self.collect_mutated_names_with_initial(
             body,
             bindings.iter().map(|binding| binding.name.clone()),
         );
+        let pair_mutated = self.collect_pair_mutated_names_with_initial(
+            body,
+            bindings.iter().map(|binding| binding.name.clone()),
+        );
         let mut scoped = env.clone();
+        let mut rooted_count = 0usize;
         for binding in bindings {
             let value = self.compile_expr(builder, current_function, &scoped, &binding.value)?;
             let stored = if mutables.contains(&binding.name) {
                 self.box_value(builder, value, &format!("let_star.{}.box", binding.name))?
+            } else if pair_mutated.contains(&binding.name) {
+                rooted_count += 1;
+                self.root_word(
+                    builder,
+                    self.value_to_word(builder, value, &format!("let_star.{}.word", binding.name))?,
+                    &format!("let_star.{}.root", binding.name),
+                )?
             } else {
                 value
             };
             scoped.insert(binding.name.clone(), stored);
         }
-        Ok(scoped)
+        Ok((scoped, rooted_count))
     }
 
     fn compile_recursive_bindings(
@@ -1907,7 +2123,7 @@ impl<'ctx> Compiler<'ctx> {
         let mut binding_env = HashMap::new();
         for (name, value) in outer_env {
             let kind = match value {
-                CodegenValue::Word(_) | CodegenValue::MutableBox { .. } => {
+                CodegenValue::Word(_) | CodegenValue::RootedWord { .. } | CodegenValue::MutableBox { .. } => {
                     BindingKind::Value(AbiValueKind::Word)
                 }
                 CodegenValue::HeapObject { kind, .. } => BindingKind::Value(AbiValueKind::Heap(*kind)),
@@ -1921,7 +2137,7 @@ impl<'ctx> Compiler<'ctx> {
         let mut declared = Vec::new();
 
         for binding in bindings {
-            let ExprKind::Lambda { params, body } = &binding.value.kind else {
+            let ExprKind::Lambda { formals, body } = &binding.value.kind else {
                 return Err(CompileError::Codegen(
                     "letrec currently supports only lambda bindings".into(),
                 ));
@@ -1936,7 +2152,7 @@ impl<'ctx> Compiler<'ctx> {
             let signature = function_signatures
                 .get(&binding.name)
                 .copied()
-                .unwrap_or_else(|| self.default_signature(params.len()));
+                .unwrap_or_else(|| self.default_signature(formals));
             let function = self.declare_closure_function(&function_name, signature);
             provisional_env.insert(
                 binding.name.clone(),
@@ -1945,13 +2161,19 @@ impl<'ctx> Compiler<'ctx> {
                     signature,
                 }),
             );
-            declared.push((binding.name.clone(), function, signature, params.clone(), (**body).clone()));
+            declared.push((
+                binding.name.clone(),
+                function,
+                signature,
+                formals.clone(),
+                (**body).clone(),
+            ));
         }
 
         let mut captures_by_name: HashMap<String, Vec<(String, CaptureKind)>> = HashMap::new();
         let mut env = HashMap::new();
-        for (name, function, signature, params, body) in &declared {
-            let captures = self.collect_captures(&provisional_env, params, body)?;
+        for (name, function, signature, formals, body) in &declared {
+            let captures = self.collect_captures(&provisional_env, formals, body)?;
             let closure_value = self.allocate_placeholder_closure(
                 builder,
                 *function,
@@ -1998,11 +2220,11 @@ impl<'ctx> Compiler<'ctx> {
             }
         }
 
-        for (name, function, signature, params, body) in declared {
+        for (name, function, signature, formals, body) in declared {
             let captures = captures_by_name.remove(&name).ok_or_else(|| {
                 CompileError::Codegen(format!("missing letrec captures for '{}'", name))
             })?;
-            self.compile_closure_body(function, signature, &params, &captures, &body)?;
+            self.compile_closure_body(function, signature, &formals, &captures, &body)?;
         }
 
         Ok(env)
@@ -2012,21 +2234,21 @@ impl<'ctx> Compiler<'ctx> {
         &mut self,
         builder: &Builder<'ctx>,
         env: &HashMap<String, CodegenValue<'ctx>>,
-        params: &[String],
+        formals: &Formals,
         body: &Expr,
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         let function_name = format!("__lambda_{}", self.lambda_counter);
         self.lambda_counter += 1;
-        let signature = self.infer_lambda_signature_from_values(env, params, body);
-        let captures = self.collect_captures(env, params, body)?;
+        let signature = self.infer_lambda_signature_from_values(env, formals, body);
+        let captures = self.collect_captures(env, formals, body)?;
         if captures.is_empty() {
             let function = self.declare_lambda_function(&function_name, signature);
             let info = FunctionInfo { value: function, signature };
-            self.compile_function_body(info, params, body, &HashMap::new())?;
+            self.compile_function_body(info, formals, body, &HashMap::new())?;
             Ok(CodegenValue::Function(info))
         } else {
             let function = self.declare_closure_function(&function_name, signature);
-            self.compile_closure_body(function, signature, params, &captures, body)?;
+            self.compile_closure_body(function, signature, formals, &captures, body)?;
             self.compile_closure_allocation(builder, env, function, signature, &captures)
         }
     }
@@ -2060,12 +2282,13 @@ impl<'ctx> Compiler<'ctx> {
     fn function_type(&self, signature: FunctionSignature) -> inkwell::types::FunctionType<'ctx> {
         let gc_ptr = gc_ptr_type(self.context);
         let params = signature
-            .param_kinds
+            .required_param_kinds
             .iter()
             .map(|kind| match kind {
                 AbiValueKind::Word => self.word_type().into(),
                 AbiValueKind::Heap(_) => gc_ptr.into(),
             })
+            .chain(signature.rest.then_some(self.word_type().into()))
             .collect::<Vec<_>>();
         match signature.return_kind {
             AbiValueKind::Word => self.word_type().fn_type(&params, false),
@@ -2079,13 +2302,16 @@ impl<'ctx> Compiler<'ctx> {
     ) -> inkwell::types::FunctionType<'ctx> {
         let gc_ptr = gc_ptr_type(self.context);
         let mut params: Vec<inkwell::types::BasicMetadataTypeEnum<'ctx>> =
-            Vec::with_capacity(signature.param_kinds.len() + 1);
+            Vec::with_capacity(signature.required_param_kinds.len() + 1 + usize::from(signature.rest));
         params.push(gc_ptr.into());
-        for kind in signature.param_kinds {
+        for kind in signature.required_param_kinds {
             params.push(match kind {
                 AbiValueKind::Word => self.word_type().into(),
                 AbiValueKind::Heap(_) => gc_ptr.into(),
             });
+        }
+        if signature.rest {
+            params.push(self.word_type().into());
         }
         match signature.return_kind {
             AbiValueKind::Word => self.word_type().fn_type(&params, false),
@@ -2162,6 +2388,56 @@ impl<'ctx> Compiler<'ctx> {
             .map(|value| value.into_int_value())
     }
 
+    fn load_rooted_word(
+        &self,
+        builder: &Builder<'ctx>,
+        slot: PointerValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, CompileError> {
+        builder
+            .build_load(self.word_type(), slot, name)
+            .map_err(|error| CompileError::Codegen(error.to_string()))
+            .map(|value| value.into_int_value())
+    }
+
+    fn root_word(
+        &self,
+        builder: &Builder<'ctx>,
+        value: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<CodegenValue<'ctx>, CompileError> {
+        let slot = builder
+            .build_alloca(self.word_type(), name)
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        builder
+            .build_store(slot, value)
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        let raw_ptr = builder
+            .build_pointer_cast(
+                slot,
+                self.context.ptr_type(inkwell::AddressSpace::default()),
+                &format!("{name}.raw"),
+            )
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        builder
+            .build_call(self.runtime.rt_root_slot_push, &[raw_ptr.into()], &format!("{name}.push"))
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        Ok(CodegenValue::RootedWord { slot })
+    }
+
+    fn pop_root_slots(
+        &self,
+        builder: &Builder<'ctx>,
+        count: usize,
+    ) -> Result<(), CompileError> {
+        for _ in 0..count {
+            builder
+                .build_call(self.runtime.rt_root_slot_pop, &[], "root.pop")
+                .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn box_value(
         &self,
         builder: &Builder<'ctx>,
@@ -2179,11 +2455,60 @@ impl<'ctx> Compiler<'ctx> {
         Ok(CodegenValue::MutableBox { ptr })
     }
 
-    fn default_signature(&self, param_count: usize) -> FunctionSignature {
-        let param_kinds = vec![AbiValueKind::Word; param_count].into_boxed_slice();
+    fn build_list_value(
+        &mut self,
+        builder: &Builder<'ctx>,
+        current_function: FunctionValue<'ctx>,
+        env: &HashMap<String, CodegenValue<'ctx>>,
+        exprs: &[Expr],
+        name: &str,
+    ) -> Result<IntValue<'ctx>, CompileError> {
+        let mut result = self.word_type().const_int(EMPTY_LIST as u64, false);
+        for (index, expr) in exprs.iter().enumerate().rev() {
+            let value = self.compile_expr(builder, current_function, env, expr)?;
+            let car = self.value_to_word(builder, value, &format!("{name}.item.{index}"))?;
+            let pair =
+                self.alloc_pair_rooted(builder, car, result, &format!("{name}.cons.{index}"))?;
+            result = builder
+                .build_ptr_to_int(pair, self.word_type(), &format!("{name}.word.{index}"))
+                .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        }
+        Ok(result)
+    }
+
+    fn alloc_pair_rooted(
+        &self,
+        builder: &Builder<'ctx>,
+        car: IntValue<'ctx>,
+        cdr: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, CompileError> {
+        let rooted_car = self.root_word(builder, car, &format!("{name}.car.root"))?;
+        let rooted_cdr = self.root_word(builder, cdr, &format!("{name}.cdr.root"))?;
+        let car_word = self.value_to_word(builder, rooted_car, &format!("{name}.car"))?;
+        let cdr_word = self.value_to_word(builder, rooted_cdr, &format!("{name}.cdr"))?;
+        let call = builder
+            .build_call(
+                self.runtime.alloc_pair_gc,
+                &[car_word.into(), cdr_word.into()],
+                name,
+            )
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        let result = call
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CompileError::Codegen("pair allocation did not return a value".into()))?
+            .into_pointer_value();
+        self.pop_root_slots(builder, 2)?;
+        Ok(result)
+    }
+
+    fn default_signature(&self, formals: &Formals) -> FunctionSignature {
+        let param_kinds = vec![AbiValueKind::Word; formals.required.len()].into_boxed_slice();
         FunctionSignature {
             return_kind: AbiValueKind::Word,
-            param_kinds: Box::leak(param_kinds),
+            required_param_kinds: Box::leak(param_kinds),
+            rest: formals.rest.is_some(),
         }
     }
 
@@ -2195,13 +2520,22 @@ impl<'ctx> Compiler<'ctx> {
         for item in &program.items {
             if let TopLevel::Procedure(procedure) = item {
                 let mut env = HashMap::new();
-                let param_kinds = self.infer_param_kinds(&procedure.params, &procedure.body);
-                for (param, kind) in procedure.params.iter().zip(param_kinds.iter().copied()) {
+                let param_kinds = self.infer_param_kinds(&procedure.formals.required, &procedure.body);
+                for (param, kind) in procedure
+                    .formals
+                    .required
+                    .iter()
+                    .zip(param_kinds.iter().copied())
+                {
                     env.insert(param.clone(), BindingKind::Value(kind));
+                }
+                if let Some(rest) = &procedure.formals.rest {
+                    env.insert(rest.clone(), BindingKind::Value(AbiValueKind::Word));
                 }
                 let signature = FunctionSignature {
                     return_kind: self.infer_expr_kind(&procedure.body, &env, &functions),
-                    param_kinds: Box::leak(param_kinds.into_boxed_slice()),
+                    required_param_kinds: Box::leak(param_kinds.into_boxed_slice()),
+                    rest: procedure.formals.rest.is_some(),
                 };
                 functions.insert(procedure.name.clone(), signature);
             }
@@ -2223,15 +2557,15 @@ impl<'ctx> Compiler<'ctx> {
     ) -> HashMap<String, FunctionSignature> {
         let mut functions = HashMap::new();
         for binding in bindings {
-            if let ExprKind::Lambda { params, .. } = &binding.value.kind {
-                functions.insert(binding.name.clone(), self.default_signature(params.len()));
+            if let ExprKind::Lambda { formals, .. } = &binding.value.kind {
+                functions.insert(binding.name.clone(), self.default_signature(formals));
             }
         }
 
         for _ in 0..bindings.len().max(1) {
             let mut next = functions.clone();
             for binding in bindings {
-                let ExprKind::Lambda { params, body } = &binding.value.kind else {
+                let ExprKind::Lambda { formals: params, body } = &binding.value.kind else {
                     continue;
                 };
                 let mut env = outer_env.clone();
@@ -2240,7 +2574,10 @@ impl<'ctx> Compiler<'ctx> {
                         let signature = functions
                             .get(&other.name)
                             .copied()
-                            .unwrap_or_else(|| self.default_signature(0));
+                            .unwrap_or_else(|| self.default_signature(&Formals {
+                                required: Vec::new(),
+                                rest: None,
+                            }));
                         env.insert(other.name.clone(), BindingKind::Function(signature));
                     }
                 }
@@ -2261,13 +2598,13 @@ impl<'ctx> Compiler<'ctx> {
     fn infer_lambda_signature_from_values(
         &self,
         value_env: &HashMap<String, CodegenValue<'ctx>>,
-        params: &[String],
+        formals: &Formals,
         body: &Expr,
     ) -> FunctionSignature {
         let mut binding_env: HashMap<String, BindingKind> = HashMap::new();
         for (name, value) in value_env {
             let kind = match value {
-                CodegenValue::Word(_) | CodegenValue::MutableBox { .. } => {
+                CodegenValue::Word(_) | CodegenValue::RootedWord { .. } | CodegenValue::MutableBox { .. } => {
                     BindingKind::Value(AbiValueKind::Word)
                 }
                 CodegenValue::HeapObject { kind, .. } => BindingKind::Value(AbiValueKind::Heap(*kind)),
@@ -2276,24 +2613,28 @@ impl<'ctx> Compiler<'ctx> {
             };
             binding_env.insert(name.clone(), kind);
         }
-        self.infer_lambda_signature_with_env(params, body, &binding_env, &HashMap::new())
+        self.infer_lambda_signature_with_env(formals, body, &binding_env, &HashMap::new())
     }
 
     fn infer_lambda_signature_with_env(
         &self,
-        params: &[String],
+        formals: &Formals,
         body: &Expr,
         outer_env: &HashMap<String, BindingKind>,
         functions: &HashMap<String, FunctionSignature>,
     ) -> FunctionSignature {
         let mut env = outer_env.clone();
-        let param_kinds = self.infer_param_kinds(params, body);
-        for (param, kind) in params.iter().zip(param_kinds.iter().copied()) {
+        let param_kinds = self.infer_param_kinds(&formals.required, body);
+        for (param, kind) in formals.required.iter().zip(param_kinds.iter().copied()) {
             env.insert(param.clone(), BindingKind::Value(kind));
+        }
+        if let Some(rest) = &formals.rest {
+            env.insert(rest.clone(), BindingKind::Value(AbiValueKind::Word));
         }
         FunctionSignature {
             return_kind: self.infer_expr_kind(body, &env, functions),
-            param_kinds: Box::leak(param_kinds.into_boxed_slice()),
+            required_param_kinds: Box::leak(param_kinds.into_boxed_slice()),
+            rest: formals.rest.is_some(),
         }
     }
 
@@ -2322,7 +2663,7 @@ impl<'ctx> Compiler<'ctx> {
             ExprKind::Let { bindings, body } => {
                 let mut scoped = env.clone();
                 for binding in bindings {
-                    if let ExprKind::Lambda { params, body } = &binding.value.kind {
+                    if let ExprKind::Lambda { formals: params, body } = &binding.value.kind {
                         scoped.insert(
                             binding.name.clone(),
                             BindingKind::Function(
@@ -2339,7 +2680,7 @@ impl<'ctx> Compiler<'ctx> {
             ExprKind::LetStar { bindings, body } => {
                 let mut scoped = env.clone();
                 for binding in bindings {
-                    if let ExprKind::Lambda { params, body } = &binding.value.kind {
+                    if let ExprKind::Lambda { formals: params, body } = &binding.value.kind {
                         scoped.insert(
                             binding.name.clone(),
                             BindingKind::Function(self.infer_lambda_signature_with_env(
@@ -2364,7 +2705,12 @@ impl<'ctx> Compiler<'ctx> {
                         let signature = function_signatures
                             .get(&binding.name)
                             .copied()
-                            .unwrap_or_else(|| self.default_signature(0));
+                            .unwrap_or_else(|| {
+                                self.default_signature(&Formals {
+                                    required: Vec::new(),
+                                    rest: None,
+                                })
+                            });
                         scoped.insert(binding.name.clone(), BindingKind::Function(signature));
                     }
                 }
@@ -2494,8 +2840,13 @@ impl<'ctx> Compiler<'ctx> {
                     combine_abi_kind(kind, self.infer_param_kind(param, arg))
                 })
             }
-            ExprKind::Lambda { params, body } => {
-                if params.iter().any(|candidate| candidate == param) {
+            ExprKind::Lambda { formals, body } => {
+                if formals
+                    .required
+                    .iter()
+                    .any(|candidate| candidate == param)
+                    || formals.rest.as_deref() == Some(param)
+                {
                     AbiValueKind::Word
                 } else {
                     self.infer_param_kind(param, body)
@@ -2507,11 +2858,11 @@ impl<'ctx> Compiler<'ctx> {
     fn collect_captures(
         &self,
         env: &HashMap<String, CodegenValue<'ctx>>,
-        params: &[String],
+        formals: &Formals,
         body: &Expr,
     ) -> Result<Vec<(String, CaptureKind)>, CompileError> {
         let env_names = env.keys().cloned().collect::<std::collections::HashSet<_>>();
-        let mut bound = params.to_vec();
+        let mut bound = formals.all_names();
         let mut names = std::collections::BTreeSet::new();
         self.collect_free_vars(body, &env_names, &mut bound, &mut names);
 
@@ -2521,7 +2872,9 @@ impl<'ctx> Compiler<'ctx> {
                 CompileError::Codegen(format!("captured variable '{name}' is missing from the environment"))
             })?;
             let kind = match value {
-                CodegenValue::Word(_) => CaptureKind::Value(AbiValueKind::Word),
+                CodegenValue::Word(_) | CodegenValue::RootedWord { .. } => {
+                    CaptureKind::Value(AbiValueKind::Word)
+                }
                 CodegenValue::MutableBox { .. } => CaptureKind::Value(AbiValueKind::Heap(HeapValueKind::Box)),
                 CodegenValue::HeapObject { kind, .. } => CaptureKind::Value(AbiValueKind::Heap(kind)),
                 CodegenValue::Function(info) => CaptureKind::Function(info.signature),
@@ -2577,9 +2930,9 @@ impl<'ctx> Compiler<'ctx> {
                     self.collect_free_vars(arg, env_names, bound, out);
                 }
             }
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda { formals: params, body } => {
                 let start = bound.len();
-                bound.extend(params.iter().cloned());
+                bound.extend(params.all_names());
                 self.collect_free_vars(body, env_names, bound, out);
                 bound.truncate(start);
             }
@@ -2617,7 +2970,7 @@ impl<'ctx> Compiler<'ctx> {
         &mut self,
         function: FunctionValue<'ctx>,
         signature: FunctionSignature,
-        params: &[String],
+        formals: &Formals,
         captures: &[(String, CaptureKind)],
         body: &Expr,
     ) -> Result<(), CompileError> {
@@ -2637,7 +2990,11 @@ impl<'ctx> Compiler<'ctx> {
         })?;
 
         let mut env = HashMap::new();
-        let mutated_names = self.collect_mutated_names_with_initial(body, params.iter().cloned());
+        let formal_names = formals.all_names();
+        let mutated_names = self.collect_mutated_names_with_initial(body, formal_names.clone());
+        let pair_mutated_names =
+            self.collect_pair_mutated_names_with_initial(body, formal_names);
+        let mut rooted_param_count = 0usize;
         for (index, (name, kind)) in captures.iter().enumerate() {
             let captured = self.load_closure_env_word(
                 &builder,
@@ -2670,7 +3027,7 @@ impl<'ctx> Compiler<'ctx> {
             env.insert(name.clone(), value);
         }
 
-        for (index, param_name) in params.iter().enumerate() {
+        for (index, param_name) in formals.required.iter().enumerate() {
             let param = function
                 .get_nth_param((index + 1) as u32)
                 .ok_or_else(|| {
@@ -2679,7 +3036,12 @@ impl<'ctx> Compiler<'ctx> {
                         function.get_name().to_str().unwrap_or("<lambda>")
                     ))
                 })?;
-            let value = match signature.param_kinds.get(index).copied().unwrap_or(AbiValueKind::Word) {
+            let value = match signature
+                .required_param_kinds
+                .get(index)
+                .copied()
+                .unwrap_or(AbiValueKind::Word)
+            {
                 AbiValueKind::Word => CodegenValue::Word(param.into_int_value()),
                 AbiValueKind::Heap(kind) => CodegenValue::HeapObject {
                     ptr: param.into_pointer_value(),
@@ -2688,22 +3050,54 @@ impl<'ctx> Compiler<'ctx> {
             };
             let stored = if mutated_names.contains(param_name) {
                 self.box_value(&builder, value, &format!("closure.param.{param_name}.box"))?
+            } else if pair_mutated_names.contains(param_name) {
+                rooted_param_count += 1;
+                self.root_word(
+                    &builder,
+                    self.value_to_word(&builder, value, &format!("closure.param.{param_name}.word"))?,
+                    &format!("closure.param.{param_name}.root"),
+                )?
             } else {
                 value
             };
             env.insert(param_name.clone(), stored);
+        }
+        if let Some(rest_name) = &formals.rest {
+            let index = formals.required.len() + 1;
+            let param = function.get_nth_param(index as u32).ok_or_else(|| {
+                CompileError::Codegen(format!(
+                    "missing rest parameter for function '{}'",
+                    function.get_name().to_str().unwrap_or("<lambda>")
+                ))
+            })?;
+            let value = CodegenValue::Word(param.into_int_value());
+            let stored = if mutated_names.contains(rest_name) {
+                self.box_value(&builder, value, &format!("closure.param.{rest_name}.box"))?
+            } else if pair_mutated_names.contains(rest_name) {
+                rooted_param_count += 1;
+                self.root_word(
+                    &builder,
+                    self.value_to_word(&builder, value, &format!("closure.param.{rest_name}.word"))?,
+                    &format!("closure.param.{rest_name}.root"),
+                )?
+            } else {
+                value
+            };
+            env.insert(rest_name.clone(), stored);
         }
 
         let body_value = self.compile_expr(&builder, function, &env, body)?;
         match signature.return_kind {
             AbiValueKind::Word => {
                 let return_value = self.value_to_word(&builder, body_value, "closure.return")?;
+                self.pop_root_slots(&builder, rooted_param_count)?;
                 builder
                     .build_return(Some(&return_value))
                     .map_err(|error| CompileError::Codegen(error.to_string()))?;
             }
             AbiValueKind::Heap(kind) => {
                 let return_value = self.expect_heap_object(body_value, kind, "closure.return")?;
+                self.pop_root_slots(&builder, rooted_param_count)?;
                 builder
                     .build_return(Some(&return_value))
                     .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -2871,6 +3265,30 @@ impl<'ctx> Compiler<'ctx> {
         mutated
     }
 
+    fn collect_program_pair_mutations(
+        &self,
+        program: &Program,
+    ) -> std::collections::HashSet<String> {
+        let mut pair_mutated = std::collections::HashSet::new();
+        let mut bound = Vec::new();
+        for item in &program.items {
+            match item {
+                TopLevel::Definition { name, value } => {
+                    bound.push(name.clone());
+                    self.collect_pair_mutated_in_expr(value, &mut bound, &mut pair_mutated);
+                }
+                TopLevel::Procedure(procedure) => {
+                    bound.push(procedure.name.clone());
+                    self.collect_pair_mutated_in_expr(&procedure.body, &mut bound, &mut pair_mutated);
+                }
+                TopLevel::Expression(expr) => {
+                    self.collect_pair_mutated_in_expr(expr, &mut bound, &mut pair_mutated);
+                }
+            }
+        }
+        pair_mutated
+    }
+
     fn collect_mutated_names_with_initial(
         &self,
         expr: &Expr,
@@ -2880,6 +3298,17 @@ impl<'ctx> Compiler<'ctx> {
         let mut bound = initial.into_iter().collect::<Vec<_>>();
         self.collect_mutated_in_expr(expr, &mut bound, &mut mutated);
         mutated
+    }
+
+    fn collect_pair_mutated_names_with_initial(
+        &self,
+        expr: &Expr,
+        initial: impl IntoIterator<Item = String>,
+    ) -> std::collections::HashSet<String> {
+        let mut pair_mutated = std::collections::HashSet::new();
+        let mut bound = initial.into_iter().collect::<Vec<_>>();
+        self.collect_pair_mutated_in_expr(expr, &mut bound, &mut pair_mutated);
+        pair_mutated
     }
 
     fn collect_mutated_in_expr(
@@ -2922,9 +3351,9 @@ impl<'ctx> Compiler<'ctx> {
                 self.collect_mutated_in_expr(then_branch, bound, out);
                 self.collect_mutated_in_expr(else_branch, bound, out);
             }
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda { formals: params, body } => {
                 let start = bound.len();
-                bound.extend(params.iter().cloned());
+                bound.extend(params.all_names());
                 self.collect_mutated_in_expr(body, bound, out);
                 bound.truncate(start);
             }
@@ -2953,6 +3382,86 @@ impl<'ctx> Compiler<'ctx> {
                     self.collect_mutated_in_expr(&binding.value, bound, out);
                 }
                 self.collect_mutated_in_expr(body, bound, out);
+                bound.truncate(start);
+            }
+        }
+    }
+
+    fn collect_pair_mutated_in_expr(
+        &self,
+        expr: &Expr,
+        bound: &mut Vec<String>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        match &expr.kind {
+            ExprKind::Unspecified
+            | ExprKind::Integer(_)
+            | ExprKind::Boolean(_)
+            | ExprKind::Char(_)
+            | ExprKind::String(_)
+            | ExprKind::Variable(_)
+            | ExprKind::Quote(_) => {}
+            ExprKind::Set { value, .. } => {
+                self.collect_pair_mutated_in_expr(value, bound, out);
+            }
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Variable(name) = &callee.kind
+                    && matches!(name.as_str(), "set-car!" | "set-cdr!")
+                    && let Some(Expr { kind: ExprKind::Variable(target) }) = args.first()
+                    && bound.iter().any(|bound_name| bound_name == target)
+                {
+                    out.insert(target.clone());
+                }
+                self.collect_pair_mutated_in_expr(callee, bound, out);
+                for arg in args {
+                    self.collect_pair_mutated_in_expr(arg, bound, out);
+                }
+            }
+            ExprKind::Begin(exprs) => {
+                for expr in exprs {
+                    self.collect_pair_mutated_in_expr(expr, bound, out);
+                }
+            }
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.collect_pair_mutated_in_expr(condition, bound, out);
+                self.collect_pair_mutated_in_expr(then_branch, bound, out);
+                self.collect_pair_mutated_in_expr(else_branch, bound, out);
+            }
+            ExprKind::Lambda { formals: params, body } => {
+                let start = bound.len();
+                bound.extend(params.all_names());
+                self.collect_pair_mutated_in_expr(body, bound, out);
+                bound.truncate(start);
+            }
+            ExprKind::Let { bindings, body } => {
+                for binding in bindings {
+                    self.collect_pair_mutated_in_expr(&binding.value, bound, out);
+                }
+                let start = bound.len();
+                bound.extend(bindings.iter().map(|binding| binding.name.clone()));
+                self.collect_pair_mutated_in_expr(body, bound, out);
+                bound.truncate(start);
+            }
+            ExprKind::LetStar { bindings, body } => {
+                let start = bound.len();
+                for binding in bindings {
+                    self.collect_pair_mutated_in_expr(&binding.value, bound, out);
+                    bound.push(binding.name.clone());
+                }
+                self.collect_pair_mutated_in_expr(body, bound, out);
+                bound.truncate(start);
+            }
+            ExprKind::LetRec { bindings, body } => {
+                let start = bound.len();
+                bound.extend(bindings.iter().map(|binding| binding.name.clone()));
+                for binding in bindings {
+                    self.collect_pair_mutated_in_expr(&binding.value, bound, out);
+                }
+                self.collect_pair_mutated_in_expr(body, bound, out);
                 bound.truncate(start);
             }
         }
@@ -3065,6 +3574,9 @@ impl<'ctx> Compiler<'ctx> {
     ) -> Result<IntValue<'ctx>, CompileError> {
         match value {
             CodegenValue::Word(value) => Ok(value),
+            CodegenValue::RootedWord { .. } => Err(CompileError::Codegen(format!(
+                "{context} expected a Scheme word, but a rooted stack value was produced"
+            ))),
             CodegenValue::MutableBox { .. } => Err(CompileError::Codegen(format!(
                 "{context} expected a Scheme word, but a mutable binding cell was produced"
             ))),
@@ -3086,6 +3598,7 @@ impl<'ctx> Compiler<'ctx> {
     ) -> Result<IntValue<'ctx>, CompileError> {
         match value {
             CodegenValue::Word(value) => Ok(value),
+            CodegenValue::RootedWord { slot } => self.load_rooted_word(builder, slot, context),
             CodegenValue::MutableBox { ptr } => builder
                 .build_ptr_to_int(ptr, self.word_type(), context)
                 .map_err(|error| CompileError::Codegen(error.to_string())),
@@ -3114,7 +3627,7 @@ impl<'ctx> Compiler<'ctx> {
                 heap_kind_name(expected_kind),
                 heap_kind_name(kind)
             ))),
-            CodegenValue::Word(_) => Err(CompileError::Codegen(format!(
+            CodegenValue::Word(_) | CodegenValue::RootedWord { .. } => Err(CompileError::Codegen(format!(
                 "{context} expected a {} heap reference, but a Scheme word was produced",
                 heap_kind_name(expected_kind)
             ))),
@@ -3146,6 +3659,10 @@ impl<'ctx> Compiler<'ctx> {
                 phi.add_incoming(&[(&then_word, then_block), (&else_word, else_block)]);
                 Ok(CodegenValue::Word(phi.as_basic_value().into_int_value()))
             }
+            (CodegenValue::RootedWord { .. }, _)
+            | (_, CodegenValue::RootedWord { .. }) => Err(CompileError::Codegen(
+                "if branches cannot currently merge rooted stack values".into(),
+            )),
             (
                 CodegenValue::HeapObject {
                     ptr: then_ptr,
@@ -3226,6 +3743,13 @@ impl<'ctx> Compiler<'ctx> {
             (CodegenValue::Word(lhs), CodegenValue::Word(rhs)) => builder
                 .build_int_compare(IntPredicate::EQ, lhs, rhs, name)
                 .map_err(|error| CompileError::Codegen(error.to_string())),
+            (CodegenValue::RootedWord { slot: lhs }, CodegenValue::RootedWord { slot: rhs }) => {
+                let lhs_word = self.load_rooted_word(builder, lhs, &format!("{name}.lhs.word"))?;
+                let rhs_word = self.load_rooted_word(builder, rhs, &format!("{name}.rhs.word"))?;
+                builder
+                    .build_int_compare(IntPredicate::EQ, lhs_word, rhs_word, name)
+                    .map_err(|error| CompileError::Codegen(error.to_string()))
+            }
             (
                 CodegenValue::HeapObject {
                     ptr: lhs,
@@ -3246,6 +3770,9 @@ impl<'ctx> Compiler<'ctx> {
             }
             (CodegenValue::MutableBox { ptr: lhs }, CodegenValue::MutableBox { ptr: rhs }) => {
                 self.compare_gc_pointers(builder, lhs, rhs, name)
+            }
+            (CodegenValue::RootedWord { .. }, _) | (_, CodegenValue::RootedWord { .. }) => {
+                Ok(self.context.bool_type().const_zero())
             }
             _ => Ok(self.context.bool_type().const_zero()),
         }
@@ -3274,8 +3801,8 @@ impl<'ctx> Compiler<'ctx> {
             Datum::Integer(_) | Datum::Boolean(_) | Datum::Char(_) => AbiValueKind::Word,
             Datum::String(_) => AbiValueKind::Heap(HeapValueKind::String),
             Datum::Symbol(_) => AbiValueKind::Heap(HeapValueKind::Symbol),
-            Datum::List(items) if items.is_empty() => AbiValueKind::Word,
-            Datum::List(_) => AbiValueKind::Heap(HeapValueKind::Pair),
+            Datum::List { items, tail } if items.is_empty() && tail.is_none() => AbiValueKind::Word,
+            Datum::List { .. } => AbiValueKind::Heap(HeapValueKind::Pair),
         }
     }
 
@@ -3309,9 +3836,13 @@ fn is_builtin(name: &str) -> bool {
             | "eqv?"
             | "list"
             | "append"
+            | "list-copy"
+            | "reverse"
             | "cons"
             | "car"
             | "cdr"
+            | "set-car!"
+            | "set-cdr!"
             | "pair?"
             | "list?"
             | "length"
