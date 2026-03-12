@@ -1,6 +1,5 @@
 # mlisp
-
-`mlisp` is now structured as a compiler project instead of a placeholder crate.
+A small project to test codex. it compiles scheme to llvm using mmtk for GC. 
 
 Current direction:
 
