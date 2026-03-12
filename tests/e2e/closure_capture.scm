@@ -1,0 +1,12 @@
+(let ((x 41)
+      (p (cons 7 8))
+      (v (vector 1 2 3)))
+  (begin
+    (display ((lambda () (+ x 1))))
+    (newline)
+    (gc-stress 32)
+    (display (car ((lambda () p))))
+    (newline)
+    (display (vector-ref ((lambda () v)) 2))
+    (newline)
+    0))

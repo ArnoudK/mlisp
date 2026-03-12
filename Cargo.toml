@@ -1,0 +1,11 @@
+[package]
+name = "mlisp"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = [".", "runtime"]
+
+[dependencies]
+inkwell = { version = "0.8.0", features = ["llvm21-1-prefer-dynamic"] }
+mlisp-runtime = { path = "runtime" }

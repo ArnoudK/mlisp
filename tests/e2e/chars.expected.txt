@@ -1,0 +1,4 @@
+#\x
+#\space
+#\newline
+#t

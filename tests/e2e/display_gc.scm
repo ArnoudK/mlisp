@@ -1,0 +1,13 @@
+(let ((v (vector 1 2 3))
+      (s "hi")
+      (p (cons 1 2)))
+  (begin
+    (gc-stress 64)
+    (display (vector-ref v 1))
+    (newline)
+    (write s)
+    (newline)
+    (write p)
+    (newline)
+    (display v)
+    0))

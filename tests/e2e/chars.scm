@@ -1,0 +1,10 @@
+(begin
+  (write #\x)
+  (newline)
+  (write #\space)
+  (newline)
+  (write '#\newline)
+  (newline)
+  (display (char? #\x))
+  (newline)
+  0)

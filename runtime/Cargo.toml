@@ -1,0 +1,10 @@
+[package]
+name = "mlisp-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+mmtk = "0.32.0"

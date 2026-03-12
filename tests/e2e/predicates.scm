@@ -1,0 +1,13 @@
+(begin
+  (display (symbol? 'hello))
+  (newline)
+  (display (boolean? #t))
+  (newline)
+  (display (boolean? 1))
+  (newline)
+  (display (procedure? (lambda (x) x)))
+  (newline)
+  (let ((f (lambda (x) x)))
+    (display (procedure? f))
+    (newline))
+  0)
