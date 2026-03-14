@@ -1,0 +1,6 @@
+(let ((p (delay (+ 1 2))))
+  (display (force p))
+  (newline)
+  (display (force p))
+  (newline)
+  0)

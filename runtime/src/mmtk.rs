@@ -1,6 +1,6 @@
 use crate::error::RuntimeError;
 use crate::layout::{ALIGNMENT, ObjectHeader};
-use crate::object::{BoxObject, ClosureObject, HeapKind, PairObject, StringObject, SymbolObject, VectorObject};
+use crate::object::{BoxObject, ClosureObject, HeapKind, PairObject, PromiseObject, StringObject, SymbolObject, ValuesObject, VectorObject};
 use crate::value::Value;
 use mmtk::memory_manager;
 use mmtk::plan::{AllocationSemantics, Mutator};
@@ -164,6 +164,8 @@ struct ThreadContext {
     tls: VMMutatorThread,
     mutator: *mut Mutator<MlispVM>,
     roots: Mutex<Vec<usize>>,
+    pending_exception: SharedRoot,
+    has_pending_exception: AtomicBool,
     blocked_epoch: AtomicU64,
     active: AtomicBool,
 }
@@ -322,6 +324,8 @@ fn bind_current_thread() -> *mut ThreadContext {
         tls: VMMutatorThread(VMThread(OpaquePointer::UNINITIALIZED)),
         mutator: ptr::null_mut(),
         roots: Mutex::new(Vec::new()),
+        pending_exception: SharedRoot::new(),
+        has_pending_exception: AtomicBool::new(false),
         blocked_epoch: AtomicU64::new(0),
         active: AtomicBool::new(true),
     });
@@ -551,6 +555,49 @@ pub fn alloc_vector_checked(elements: &[Value]) -> Result<ObjectReference, Runti
     Ok(object)
 }
 
+pub fn alloc_values_checked(elements: &[Value]) -> Result<ObjectReference, RuntimeError> {
+    let thread = current_thread();
+    let mut rooted_elements = elements.to_vec();
+    let mut roots = RootStackGuard::new(thread);
+    for value in &mut rooted_elements {
+        roots.push(&mut value.0)?;
+    }
+    let size =
+        core::mem::size_of::<ValuesObject>() + (elements.len() * core::mem::size_of::<usize>());
+    let object = alloc_raw_checked(
+        size,
+        core::mem::align_of::<ValuesObject>(),
+        HeapKind::Values.as_tag(),
+    )?;
+    unsafe {
+        let values = object.to_raw_address().to_mut_ptr::<ValuesObject>();
+        ptr::write(values, ValuesObject::new(elements.len(), size));
+        ptr::copy_nonoverlapping(
+            rooted_elements.as_ptr().cast::<usize>(),
+            (*values).elements_mut_ptr(),
+            rooted_elements.len(),
+        );
+    }
+    Ok(object)
+}
+
+pub fn alloc_promise_checked(value: Value) -> Result<ObjectReference, RuntimeError> {
+    let thread = current_thread();
+    let mut rooted_value = value.bits();
+    let mut roots = RootStackGuard::new(thread);
+    roots.push(&mut rooted_value)?;
+    let object = alloc_raw_checked(
+        core::mem::size_of::<PromiseObject>(),
+        core::mem::align_of::<PromiseObject>(),
+        HeapKind::Promise.as_tag(),
+    )?;
+    unsafe {
+        let promise = object.to_raw_address().to_mut_ptr::<PromiseObject>();
+        ptr::write(promise, PromiseObject::new(Value::from_bits(rooted_value)));
+    }
+    Ok(object)
+}
+
 pub fn object_write_post(src: ObjectReference, slot: *mut usize, target: Value) {
     object_write_post_checked(src, slot, target).unwrap();
 }
@@ -666,6 +713,31 @@ pub fn gc_stress_checked(iterations: usize) -> Result<(), RuntimeError> {
 
     pop_root_checked(thread as *const ThreadContext as *mut core::ffi::c_void)?;
     Ok(())
+}
+
+pub fn exception_pending_checked() -> Result<bool, RuntimeError> {
+    Ok(current_thread_context_checked()?
+        .has_pending_exception
+        .load(Ordering::SeqCst))
+}
+
+pub fn raise_checked(value: Value) -> Result<(), RuntimeError> {
+    let thread = current_thread_context_checked()?;
+    unsafe {
+        ptr::write(thread.pending_exception.as_ptr(), value.bits());
+    }
+    thread.has_pending_exception.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+pub fn take_pending_exception_checked() -> Result<Value, RuntimeError> {
+    let thread = current_thread_context_checked()?;
+    if !thread.has_pending_exception.swap(false, Ordering::SeqCst) {
+        return Ok(Value::unspecified());
+    }
+    Ok(Value::from_bits(unsafe {
+        ptr::read(thread.pending_exception.as_ptr())
+    }))
 }
 
 pub fn push_root_checked(
@@ -839,6 +911,16 @@ impl Scanning<MlispVM> for MlispVM {
                         slot_visitor.visit_slot(ValueSlot::from_ptr((*vector).elements_mut_ptr().add(index)));
                     }
                 }
+                tag if tag == HeapKind::Values.as_tag() => {
+                    let values = object.to_raw_address().to_mut_ptr::<ValuesObject>();
+                    for index in 0..(*values).length {
+                        slot_visitor.visit_slot(ValueSlot::from_ptr((*values).elements_mut_ptr().add(index)));
+                    }
+                }
+                tag if tag == HeapKind::Promise.as_tag() => {
+                    let promise = object.to_raw_address().to_mut_ptr::<PromiseObject>();
+                    slot_visitor.visit_slot(ValueSlot::from_ptr(ptr::addr_of_mut!((*promise).value)));
+                }
                 tag if tag == HeapKind::String.as_tag() || tag == HeapKind::Symbol.as_tag() => {}
                 _ => {}
             }
@@ -860,6 +942,11 @@ impl Scanning<MlispVM> for MlispVM {
                 .map(|slot| ValueSlot::from_ptr(slot as *mut usize))
                 .collect(),
         );
+        if thread.has_pending_exception.load(Ordering::SeqCst) {
+            factory.create_process_roots_work(vec![ValueSlot::from_ptr(
+                thread.pending_exception.as_ptr(),
+            )]);
+        }
     }
 
     fn scan_vm_specific_roots(_tls: VMWorkerThread, mut factory: impl RootsWorkFactory<ValueSlot>) {

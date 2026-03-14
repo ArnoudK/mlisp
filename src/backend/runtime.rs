@@ -9,6 +9,9 @@ pub struct RuntimeAbi<'ctx> {
     pub rt_unbind_thread: FunctionValue<'ctx>,
     pub rt_alloc_slow: FunctionValue<'ctx>,
     pub rt_gc_poll: FunctionValue<'ctx>,
+    pub rt_exception_pending: FunctionValue<'ctx>,
+    pub rt_raise: FunctionValue<'ctx>,
+    pub rt_take_pending_exception: FunctionValue<'ctx>,
     pub rt_object_write_post: FunctionValue<'ctx>,
     pub rt_root_slot_push: FunctionValue<'ctx>,
     pub rt_root_slot_pop: FunctionValue<'ctx>,
@@ -37,11 +40,25 @@ pub struct RuntimeAbi<'ctx> {
     pub list_tail: FunctionValue<'ctx>,
     pub list_ref: FunctionValue<'ctx>,
     pub append: FunctionValue<'ctx>,
+    pub memq: FunctionValue<'ctx>,
+    pub memv: FunctionValue<'ctx>,
+    pub member: FunctionValue<'ctx>,
+    pub assq: FunctionValue<'ctx>,
+    pub assv: FunctionValue<'ctx>,
+    pub assoc: FunctionValue<'ctx>,
     pub list_copy: FunctionValue<'ctx>,
     pub reverse: FunctionValue<'ctx>,
     pub alloc_box: FunctionValue<'ctx>,
     pub alloc_box_gc: FunctionValue<'ctx>,
     pub box_set_gc: FunctionValue<'ctx>,
+    pub alloc_promise: FunctionValue<'ctx>,
+    pub alloc_promise_gc: FunctionValue<'ctx>,
+    pub promise_forced: FunctionValue<'ctx>,
+    pub promise_value: FunctionValue<'ctx>,
+    pub promise_resolve: FunctionValue<'ctx>,
+    pub promise_forced_gc: FunctionValue<'ctx>,
+    pub promise_value_gc: FunctionValue<'ctx>,
+    pub promise_resolve_gc: FunctionValue<'ctx>,
     pub alloc_closure: FunctionValue<'ctx>,
     pub alloc_closure_gc: FunctionValue<'ctx>,
     pub closure_code_ptr_gc: FunctionValue<'ctx>,
@@ -52,6 +69,15 @@ pub struct RuntimeAbi<'ctx> {
     pub alloc_symbol: FunctionValue<'ctx>,
     pub alloc_symbol_gc: FunctionValue<'ctx>,
     pub is_symbol: FunctionValue<'ctx>,
+    pub alloc_values: FunctionValue<'ctx>,
+    pub is_values: FunctionValue<'ctx>,
+    pub values_length: FunctionValue<'ctx>,
+    pub values_ref: FunctionValue<'ctx>,
+    pub values_tail_list: FunctionValue<'ctx>,
+    pub equal: FunctionValue<'ctx>,
+    pub apply_builtin: FunctionValue<'ctx>,
+    pub symbol_to_string: FunctionValue<'ctx>,
+    pub string_to_symbol: FunctionValue<'ctx>,
     pub is_string: FunctionValue<'ctx>,
     pub string_length: FunctionValue<'ctx>,
     pub string_ref: FunctionValue<'ctx>,
@@ -111,8 +137,25 @@ impl<'ctx> RuntimeAbi<'ctx> {
         );
         let alloc_box_gc_raw =
             module.add_function("mlisp_alloc_box_gc", raw_ptr.fn_type(&[word.into()], false), None);
+        let alloc_promise_gc_raw =
+            module.add_function("mlisp_alloc_promise_gc", raw_ptr.fn_type(&[word.into()], false), None);
         let box_set_gc_raw = module.add_function(
             "mlisp_box_set_gc",
+            word.fn_type(&[raw_ptr.into(), word.into()], false),
+            None,
+        );
+        let promise_forced_gc_raw = module.add_function(
+            "mlisp_promise_forced_gc",
+            bool_ty.fn_type(&[raw_ptr.into()], false),
+            None,
+        );
+        let promise_value_gc_raw = module.add_function(
+            "mlisp_promise_value_gc",
+            word.fn_type(&[raw_ptr.into()], false),
+            None,
+        );
+        let promise_resolve_gc_raw = module.add_function(
+            "mlisp_promise_resolve_gc",
             word.fn_type(&[raw_ptr.into(), word.into()], false),
             None,
         );
@@ -170,7 +213,15 @@ impl<'ctx> RuntimeAbi<'ctx> {
         let alloc_symbol_gc =
             add_gc_buffer_alloc_wrapper(module, "__mlisp_alloc_symbol_gc_as1", alloc_symbol_gc_raw);
         let alloc_box_gc = add_gc_unary_alloc_wrapper(module, "__mlisp_alloc_box_gc_as1", alloc_box_gc_raw);
+        let alloc_promise_gc =
+            add_gc_unary_alloc_wrapper(module, "__mlisp_alloc_promise_gc_as1", alloc_promise_gc_raw);
         let box_set_gc = add_gc_unary_value_wrapper(module, "__mlisp_box_set_gc_as1", box_set_gc_raw);
+        let promise_forced_gc =
+            add_gc_unary_bool_wrapper(module, "__mlisp_promise_forced_gc_as1", promise_forced_gc_raw);
+        let promise_value_gc =
+            add_gc_unary_wrapper(module, "__mlisp_promise_value_gc_as1", promise_value_gc_raw);
+        let promise_resolve_gc =
+            add_gc_unary_value_wrapper(module, "__mlisp_promise_resolve_gc_as1", promise_resolve_gc_raw);
         let alloc_closure_gc =
             add_gc_code_buffer_alloc_wrapper(module, "__mlisp_alloc_closure_gc_as1", alloc_closure_gc_raw);
         let closure_code_ptr_gc =
@@ -209,6 +260,17 @@ impl<'ctx> RuntimeAbi<'ctx> {
                 None,
             ),
             rt_gc_poll: module.add_function("rt_gc_poll", context.void_type().fn_type(&[], false), None),
+            rt_exception_pending: module.add_function(
+                "rt_exception_pending",
+                bool_ty.fn_type(&[], false),
+                None,
+            ),
+            rt_raise: module.add_function("rt_raise", word.fn_type(&[word.into()], false), None),
+            rt_take_pending_exception: module.add_function(
+                "rt_take_pending_exception",
+                word.fn_type(&[], false),
+                None,
+            ),
             rt_object_write_post: module.add_function(
                 "rt_object_write_post",
                 context
@@ -273,11 +335,33 @@ impl<'ctx> RuntimeAbi<'ctx> {
             list_tail: module.add_function("mlisp_list_tail", pair_fn, None),
             list_ref: module.add_function("mlisp_list_ref", pair_fn, None),
             append: module.add_function("mlisp_append", pair_fn, None),
+            memq: module.add_function("mlisp_memq", pair_fn, None),
+            memv: module.add_function("mlisp_memv", pair_fn, None),
+            member: module.add_function("mlisp_member", pair_fn, None),
+            assq: module.add_function("mlisp_assq", pair_fn, None),
+            assv: module.add_function("mlisp_assv", pair_fn, None),
+            assoc: module.add_function("mlisp_assoc", pair_fn, None),
             list_copy: module.add_function("mlisp_list_copy", word_word_fn, None),
             reverse: module.add_function("mlisp_reverse", word_word_fn, None),
             alloc_box: module.add_function("mlisp_alloc_box", word_word_fn, None),
             alloc_box_gc,
             box_set_gc,
+            alloc_promise: module.add_function("mlisp_alloc_promise", word_word_fn, None),
+            alloc_promise_gc,
+            promise_forced: module.add_function(
+                "mlisp_promise_forced",
+                bool_ty.fn_type(&[word.into()], false),
+                None,
+            ),
+            promise_value: module.add_function("mlisp_promise_value", word_word_fn, None),
+            promise_resolve: module.add_function(
+                "mlisp_promise_resolve",
+                word.fn_type(&[word.into(), word.into()], false),
+                None,
+            ),
+            promise_forced_gc,
+            promise_value_gc,
+            promise_resolve_gc,
             alloc_closure: module.add_function(
                 "mlisp_alloc_closure",
                 word.fn_type(&[word.into(), raw_ptr.into(), word.into()], false),
@@ -296,6 +380,27 @@ impl<'ctx> RuntimeAbi<'ctx> {
                 bool_ty.fn_type(&[word.into()], false),
                 None,
             ),
+            alloc_values: module.add_function("mlisp_alloc_values", raw_words_vector_fn, None),
+            is_values: module.add_function(
+                "mlisp_is_values",
+                bool_ty.fn_type(&[word.into()], false),
+                None,
+            ),
+            values_length: module.add_function("mlisp_values_length", word_word_fn, None),
+            values_ref: module.add_function("mlisp_values_ref", pair_fn, None),
+            values_tail_list: module.add_function("mlisp_values_tail_list", pair_fn, None),
+            equal: module.add_function(
+                "mlisp_equal",
+                bool_ty.fn_type(&[word.into(), word.into()], false),
+                None,
+            ),
+            apply_builtin: module.add_function(
+                "mlisp_apply_builtin",
+                word.fn_type(&[word.into(), word.into()], false),
+                None,
+            ),
+            symbol_to_string: module.add_function("mlisp_symbol_to_string", word_word_fn, None),
+            string_to_symbol: module.add_function("mlisp_string_to_symbol", word_word_fn, None),
             is_string: module.add_function(
                 "mlisp_is_string",
                 bool_ty.fn_type(&[word.into()], false),
@@ -494,6 +599,34 @@ fn add_gc_unary_wrapper<'ctx>(
     wrapper
 }
 
+fn add_gc_unary_bool_wrapper<'ctx>(
+    module: &Module<'ctx>,
+    name: &str,
+    raw_target: FunctionValue<'ctx>,
+) -> FunctionValue<'ctx> {
+    let context = module.get_context();
+    let builder = context.create_builder();
+    let gc_ptr = context.ptr_type(heap_address_space());
+    let raw_ptr = context.ptr_type(AddressSpace::default());
+    let bool_ty = context.bool_type();
+    let wrapper = module.add_function(name, bool_ty.fn_type(&[gc_ptr.into()], false), None);
+    let entry = context.append_basic_block(wrapper, "entry");
+    builder.position_at_end(entry);
+    let arg0 = wrapper.get_nth_param(0).unwrap().into_pointer_value();
+    let raw_arg = builder
+        .build_address_space_cast(arg0, raw_ptr, "raw")
+        .unwrap();
+    let result = builder
+        .build_call(raw_target, &[raw_arg.into()], "result")
+        .unwrap()
+        .try_as_basic_value()
+        .basic()
+        .unwrap()
+        .into_int_value();
+    builder.build_return(Some(&result)).unwrap();
+    wrapper
+}
+
 fn add_gc_index_wrapper<'ctx>(
     module: &Module<'ctx>,
     name: &str,
@@ -601,6 +734,15 @@ mod tests {
         assert_eq!(abi.rt_alloc_slow.get_name().to_str(), Ok("rt_alloc_slow"));
         assert_eq!(abi.rt_gc_poll.get_name().to_str(), Ok("rt_gc_poll"));
         assert_eq!(
+            abi.rt_exception_pending.get_name().to_str(),
+            Ok("rt_exception_pending")
+        );
+        assert_eq!(abi.rt_raise.get_name().to_str(), Ok("rt_raise"));
+        assert_eq!(
+            abi.rt_take_pending_exception.get_name().to_str(),
+            Ok("rt_take_pending_exception")
+        );
+        assert_eq!(
             abi.rt_object_write_post.get_name().to_str(),
             Ok("rt_object_write_post")
         );
@@ -631,6 +773,12 @@ mod tests {
         assert_eq!(abi.list_tail.get_name().to_str(), Ok("mlisp_list_tail"));
         assert_eq!(abi.list_ref.get_name().to_str(), Ok("mlisp_list_ref"));
         assert_eq!(abi.append.get_name().to_str(), Ok("mlisp_append"));
+        assert_eq!(abi.memq.get_name().to_str(), Ok("mlisp_memq"));
+        assert_eq!(abi.memv.get_name().to_str(), Ok("mlisp_memv"));
+        assert_eq!(abi.member.get_name().to_str(), Ok("mlisp_member"));
+        assert_eq!(abi.assq.get_name().to_str(), Ok("mlisp_assq"));
+        assert_eq!(abi.assv.get_name().to_str(), Ok("mlisp_assv"));
+        assert_eq!(abi.assoc.get_name().to_str(), Ok("mlisp_assoc"));
         assert_eq!(abi.list_copy.get_name().to_str(), Ok("mlisp_list_copy"));
         assert_eq!(abi.reverse.get_name().to_str(), Ok("mlisp_reverse"));
         assert_eq!(abi.alloc_box_gc.get_name().to_str(), Ok("__mlisp_alloc_box_gc_as1"));
@@ -657,6 +805,15 @@ mod tests {
         assert_eq!(abi.alloc_symbol.get_name().to_str(), Ok("mlisp_alloc_symbol"));
         assert_eq!(abi.alloc_symbol_gc.get_name().to_str(), Ok("__mlisp_alloc_symbol_gc_as1"));
         assert_eq!(abi.is_symbol.get_name().to_str(), Ok("mlisp_is_symbol"));
+        assert_eq!(abi.alloc_values.get_name().to_str(), Ok("mlisp_alloc_values"));
+        assert_eq!(abi.is_values.get_name().to_str(), Ok("mlisp_is_values"));
+        assert_eq!(abi.values_length.get_name().to_str(), Ok("mlisp_values_length"));
+        assert_eq!(abi.values_ref.get_name().to_str(), Ok("mlisp_values_ref"));
+        assert_eq!(abi.values_tail_list.get_name().to_str(), Ok("mlisp_values_tail_list"));
+        assert_eq!(abi.equal.get_name().to_str(), Ok("mlisp_equal"));
+        assert_eq!(abi.apply_builtin.get_name().to_str(), Ok("mlisp_apply_builtin"));
+        assert_eq!(abi.symbol_to_string.get_name().to_str(), Ok("mlisp_symbol_to_string"));
+        assert_eq!(abi.string_to_symbol.get_name().to_str(), Ok("mlisp_string_to_symbol"));
         assert_eq!(abi.is_string.get_name().to_str(), Ok("mlisp_is_string"));
         assert_eq!(abi.string_length.get_name().to_str(), Ok("mlisp_string_length"));
         assert_eq!(abi.string_ref.get_name().to_str(), Ok("mlisp_string_ref"));

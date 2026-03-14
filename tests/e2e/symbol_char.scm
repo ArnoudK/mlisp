@@ -1,0 +1,13 @@
+(display (symbol->string 'hello))
+(newline)
+(write (string->symbol "world"))
+(newline)
+(display (char=? #\a #\a #\a))
+(newline)
+(display (char<? #\a #\b #\c))
+(newline)
+(display (char->integer #\A))
+(newline)
+(write (integer->char 66))
+(newline)
+0

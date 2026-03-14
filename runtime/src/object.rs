@@ -1,6 +1,6 @@
 use crate::layout::{
     HEADER_TAG_BOX, HEADER_TAG_CLOSURE, HEADER_TAG_PAIR, HEADER_TAG_STRING, HEADER_TAG_SYMBOL,
-    HEADER_TAG_VECTOR, ObjectHeader,
+    HEADER_TAG_PROMISE, HEADER_TAG_VALUES, HEADER_TAG_VECTOR, ObjectHeader,
 };
 use crate::value::Value;
 
@@ -12,6 +12,8 @@ pub enum HeapKind {
     Symbol,
     Closure,
     Box,
+    Values,
+    Promise,
 }
 
 impl HeapKind {
@@ -23,6 +25,8 @@ impl HeapKind {
             Self::Symbol => HEADER_TAG_SYMBOL,
             Self::Closure => HEADER_TAG_CLOSURE,
             Self::Box => HEADER_TAG_BOX,
+            Self::Values => HEADER_TAG_VALUES,
+            Self::Promise => HEADER_TAG_PROMISE,
         }
     }
 }
@@ -165,5 +169,53 @@ impl VectorObject {
 
     pub fn elements_mut_ptr(&mut self) -> *mut usize {
         unsafe { (self as *mut Self).cast::<usize>().add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>()) }
+    }
+}
+
+#[repr(C)]
+pub struct ValuesObject {
+    pub header: ObjectHeader,
+    pub length: usize,
+}
+
+impl ValuesObject {
+    pub fn new(length: usize, total_bytes: usize) -> Self {
+        Self {
+            header: ObjectHeader::new(HeapKind::Values.as_tag(), total_bytes as u32),
+            length,
+        }
+    }
+
+    pub fn elements_ptr(&self) -> *const usize {
+        unsafe { (self as *const Self).cast::<usize>().add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>()) }
+    }
+
+    pub fn elements_mut_ptr(&mut self) -> *mut usize {
+        unsafe { (self as *mut Self).cast::<usize>().add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>()) }
+    }
+}
+
+#[repr(C)]
+pub struct PromiseObject {
+    pub header: ObjectHeader,
+    pub value: usize,
+    pub forced: usize,
+}
+
+impl PromiseObject {
+    pub fn new(value: Value) -> Self {
+        Self {
+            header: ObjectHeader::new(HeapKind::Promise.as_tag(), core::mem::size_of::<Self>() as u32),
+            value: value.bits(),
+            forced: 0,
+        }
+    }
+
+    pub fn value(&self) -> Value {
+        Value::from_bits(self.value)
+    }
+
+    pub fn is_forced(&self) -> bool {
+        self.forced != 0
     }
 }

@@ -5,6 +5,7 @@ use std::thread;
 
 use crate::backend::{CompiledModule, LlvmBackend, pipeline, statepoint};
 use crate::error::CompileError;
+use crate::expand::expand_program;
 use crate::frontend::parse_program;
 use crate::middle::lower_program;
 
@@ -192,7 +193,8 @@ fn compile_path(path: &Path) -> Result<CompiledModule, CompileError> {
     let source = fs::read_to_string(path)
         .map_err(|error| CompileError::io(Some(path.to_path_buf()), error))?;
     let ast = parse_program(&source)?;
-    let hir = lower_program(&ast)?;
+    let expanded = expand_program(path, &ast)?;
+    let hir = lower_program(&expanded)?;
     let module_name = sanitize_module_name(path);
     LlvmBackend::compile_program(&module_name, &hir)
 }

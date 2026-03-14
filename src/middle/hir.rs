@@ -67,6 +67,13 @@ pub enum ExprKind {
         bindings: Vec<Binding>,
         body: Box<Expr>,
     },
+    Guard {
+        name: String,
+        handler: Box<Expr>,
+        body: Box<Expr>,
+    },
+    Delay(Box<Expr>),
+    Force(Box<Expr>),
     If {
         condition: Box<Expr>,
         then_branch: Box<Expr>,

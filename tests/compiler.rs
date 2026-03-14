@@ -26,6 +26,41 @@ fn lowers_r7rs_control_forms_to_core_hir() {
 }
 
 #[test]
+fn lowers_case_and_do_to_core_hir() {
+    let ast = parse_program(
+        "(begin (case 2 ((1) 0) ((2 3) 4) (else 5)) (do ((i 0 (+ i 1)) (acc 0 (+ acc i))) ((zero? (- 4 i)) acc)))\n",
+    )
+    .unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let rendered = format!("{hir:#?}");
+
+    assert!(rendered.contains("\"memv\""));
+    assert!(rendered.contains("LetRec"));
+    assert!(rendered.contains("Lambda"));
+}
+
+#[test]
+fn lowers_delay_and_force() {
+    let ast = parse_program("(begin (delay (+ 1 2)) (force (delay 4)))\n").unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let rendered = format!("{hir:#?}");
+
+    assert!(rendered.contains("Delay"));
+    assert!(rendered.contains("Force"));
+}
+
+#[test]
+fn compiles_delay_and_force_promises() {
+    let ast = parse_program("(let ((p (delay (cons 1 2)))) (car (force p)))\n").unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let compiled = LlvmBackend::compile_program("promise_module", &hir).unwrap();
+
+    assert!(compiled.llvm_ir.contains("@__mlisp_alloc_promise_gc_as1"));
+    assert!(compiled.llvm_ir.contains("@__mlisp_promise_forced_gc_as1"));
+    assert!(compiled.llvm_ir.contains("@__mlisp_promise_resolve_gc_as1"));
+}
+
+#[test]
 fn lowers_letrec_star_to_nested_letrec() {
     let ast = parse_program("(letrec* ((f (lambda () 1)) (g (lambda () (f)))) (g))\n").unwrap();
     let hir = lower_program(&ast).unwrap();
@@ -95,6 +130,94 @@ fn emits_symbol_form_rest_lambda() {
 
     assert!(compiled.llvm_ir.contains("define i64 @__lambda_0(i64 %0)"));
     assert!(compiled.llvm_ir.contains("call i64 @__lambda_0(i64"));
+}
+
+#[test]
+fn compiles_apply_for_fixed_and_variadic_procedures() {
+    let fixed_ast = parse_program("(define (add3 a b c) (+ a (+ b c))) (apply add3 '(1 2 3))\n").unwrap();
+    let variadic_ast = parse_program("(define (tail x . rest) rest) (apply tail 1 '(2 3))\n").unwrap();
+
+    let fixed_hir = lower_program(&fixed_ast).unwrap();
+    let variadic_hir = lower_program(&variadic_ast).unwrap();
+
+    let fixed_ir = LlvmBackend::compile_program("apply_fixed_module", &fixed_hir).unwrap();
+    let variadic_ir = LlvmBackend::compile_program("apply_variadic_module", &variadic_hir).unwrap();
+
+    assert!(fixed_ir.llvm_ir.contains("@mlisp_list_length"));
+    assert!(fixed_ir.llvm_ir.contains("@mlisp_list_ref"));
+    assert!(fixed_ir.llvm_ir.contains("call i64 @add3("));
+
+    assert!(variadic_ir.llvm_ir.contains("@mlisp_list_tail"));
+    assert!(variadic_ir.llvm_ir.contains("call i64 @tail("));
+}
+
+#[test]
+fn compiles_apply_for_closure_values() {
+    let ast =
+        parse_program("(let ((f (lambda (a b c) (+ a (+ b c))))) (apply f '(1 2 3)))\n").unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let compiled = LlvmBackend::compile_program("apply_closure_module", &hir).unwrap();
+
+    assert!(compiled.llvm_ir.contains("@mlisp_list_length"));
+    assert!(compiled.llvm_ir.contains("@mlisp_list_ref"));
+    assert!(compiled.llvm_ir.contains("call i64 @__lambda_0("));
+}
+
+#[test]
+fn compiles_values_and_call_with_values() {
+    let values_ast = parse_program("(values 1 2 3)\n").unwrap();
+    let call_ast = parse_program(
+        "(call-with-values (lambda () (values 1 2 3)) (lambda (a b . rest) (list a b rest)))\n",
+    )
+    .unwrap();
+
+    let values_hir = lower_program(&values_ast).unwrap();
+    let call_hir = lower_program(&call_ast).unwrap();
+
+    let values_ir = LlvmBackend::compile_program("values_module", &values_hir).unwrap();
+    let call_ir = LlvmBackend::compile_program("call_with_values_module", &call_hir).unwrap();
+
+    assert!(values_ir.llvm_ir.contains("@mlisp_alloc_values"));
+    assert!(call_ir.llvm_ir.contains("@mlisp_is_values"));
+    assert!(call_ir.llvm_ir.contains("@mlisp_values_length"));
+    assert!(call_ir.llvm_ir.contains("@mlisp_values_ref"));
+    assert!(call_ir.llvm_ir.contains("@mlisp_values_tail_list"));
+}
+
+#[test]
+fn compiles_raise_error_and_guard() {
+    let raise_ast = parse_program("(guard (exn (else exn)) (raise 7))\n").unwrap();
+    let error_ast = parse_program("(guard (exn (else exn)) (error \"boom\" 1 2))\n").unwrap();
+
+    let raise_hir = lower_program(&raise_ast).unwrap();
+    let error_hir = lower_program(&error_ast).unwrap();
+
+    let raise_ir = LlvmBackend::compile_program("raise_guard_module", &raise_hir).unwrap();
+    let error_ir = LlvmBackend::compile_program("error_guard_module", &error_hir).unwrap();
+
+    assert!(raise_ir.llvm_ir.contains("@rt_raise"));
+    assert!(raise_ir.llvm_ir.contains("@rt_exception_pending"));
+    assert!(raise_ir.llvm_ir.contains("@rt_take_pending_exception"));
+    assert!(error_ir.llvm_ir.contains("@rt_raise"));
+    assert!(error_ir.llvm_ir.contains("guard.handler"));
+}
+
+#[test]
+fn compiles_first_class_builtin_procedures() {
+    let call_ast = parse_program("(let ((f +)) (f 1 2 3))\n").unwrap();
+    let apply_ast = parse_program("(let ((f +)) (apply f '(1 2 3)))\n").unwrap();
+
+    let call_hir = lower_program(&call_ast).unwrap();
+    let apply_hir = lower_program(&apply_ast).unwrap();
+
+    let call_ir = LlvmBackend::compile_program("builtin_call_module", &call_hir).unwrap();
+    let apply_ir = LlvmBackend::compile_program("builtin_apply_module", &apply_hir).unwrap();
+
+    assert!(call_ir.llvm_ir.contains("define i64 @__builtin__"));
+    assert!(call_ir.llvm_ir.contains("call i64 @__builtin__("));
+    assert!(apply_ir.llvm_ir.contains("call i64 @__builtin__("));
+    assert!(apply_ir.llvm_ir.contains("@mlisp_list_length"));
+    assert!(apply_ir.llvm_ir.contains("@mlisp_list_ref"));
 }
 
 #[test]
@@ -234,6 +357,39 @@ fn emits_letrec_recursive_closure_with_outer_capture() {
     assert!(compiled.llvm_ir.contains("call ptr addrspace(1) @__mlisp_alloc_closure_gc_as1"));
     assert!(compiled.llvm_ir.contains("call i64 @__mlisp_closure_env_set_gc_as1"));
     assert!(compiled.llvm_ir.contains("%closure.code = load i64"));
+}
+
+#[test]
+fn emits_tail_call_for_direct_self_tail_recursion() {
+    let source = "\
+        (define (countdown n)
+          (if (zero? n)
+              0
+              (countdown (- n 1))))
+        (countdown 3)
+    ";
+    let ast = parse_program(source).unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let compiled = LlvmBackend::compile_program("musttail_direct_module", &hir).unwrap();
+
+    assert!(compiled.llvm_ir.contains("tail call i64 @countdown(i64"));
+}
+
+#[test]
+fn emits_tail_call_for_recursive_closure_tail_calls() {
+    let source = "\
+        (letrec ((countdown
+                    (lambda (n)
+                      (if (zero? n)
+                          0
+                          (countdown (- n 1))))))
+          (countdown 3))
+    ";
+    let ast = parse_program(source).unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let compiled = LlvmBackend::compile_program("musttail_closure_module", &hir).unwrap();
+
+    assert!(compiled.llvm_ir.contains("tail call i64 %closure.tail.fn"));
 }
 
 #[test]
@@ -455,6 +611,40 @@ fn compiles_symbol_boolean_and_procedure_predicates() {
 }
 
 #[test]
+fn compiles_symbol_string_and_character_procedures() {
+    let ast = parse_program(
+        "(begin (symbol->string 'hello) (string->symbol \"world\") (char=? #\\a #\\a) (char<? #\\a #\\b) (char->integer #\\A) (integer->char 66))\n",
+    )
+    .unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let compiled = LlvmBackend::compile_program("symbol_char_module", &hir).unwrap();
+
+    assert!(compiled.llvm_ir.contains("@mlisp_symbol_to_string"));
+    assert!(compiled.llvm_ir.contains("@mlisp_string_to_symbol"));
+    assert!(compiled.llvm_ir.contains("char_cmp"));
+    assert!(compiled.llvm_ir.contains("integer_to_char"));
+}
+
+#[test]
+fn compiles_equal_for_structural_values() {
+    let pair_ast = parse_program("(equal? '(1 2) '(1 2))\n").unwrap();
+    let vector_ast = parse_program("(equal? (vector 1 2) (vector 1 2))\n").unwrap();
+    let string_ast = parse_program("(equal? \"hi\" \"hi\")\n").unwrap();
+
+    let pair_hir = lower_program(&pair_ast).unwrap();
+    let vector_hir = lower_program(&vector_ast).unwrap();
+    let string_hir = lower_program(&string_ast).unwrap();
+
+    let pair_ir = LlvmBackend::compile_program("equal_pair_module", &pair_hir).unwrap();
+    let vector_ir = LlvmBackend::compile_program("equal_vector_module", &vector_hir).unwrap();
+    let string_ir = LlvmBackend::compile_program("equal_string_module", &string_hir).unwrap();
+
+    assert!(pair_ir.llvm_ir.contains("@mlisp_equal"));
+    assert!(vector_ir.llvm_ir.contains("@mlisp_equal"));
+    assert!(string_ir.llvm_ir.contains("@mlisp_equal"));
+}
+
+#[test]
 fn compiles_list_ref_tail_and_append() {
     let ref_ast = parse_program("(list-ref (list 1 2 3) 1)\n").unwrap();
     let tail_ast = parse_program("(list-tail (list 1 2 3) 1)\n").unwrap();
@@ -469,6 +659,21 @@ fn compiles_list_ref_tail_and_append() {
     assert!(ref_ir.llvm_ir.contains("@mlisp_list_ref"));
     assert!(tail_ir.llvm_ir.contains("@mlisp_list_tail"));
     assert!(append_ir.llvm_ir.contains("@mlisp_append"));
+}
+
+#[test]
+fn compiles_map_foreach_and_member_assoc() {
+    let ast = parse_program(
+        "(begin (map + '(1 2) '(3 4)) (for-each (lambda (x) x) '(1 2)) (member '(1) '((0) (1) (2))) (assoc 'b '((a . 1) (b . 2))))\n",
+    )
+    .unwrap();
+    let hir = lower_program(&ast).unwrap();
+    let compiled = LlvmBackend::compile_program("list_library_module", &hir).unwrap();
+
+    assert!(compiled.llvm_ir.contains("list_iter.cond"));
+    assert!(compiled.llvm_ir.contains("@mlisp_member"));
+    assert!(compiled.llvm_ir.contains("@mlisp_assoc"));
+    assert!(compiled.llvm_ir.contains("@__builtin__"));
 }
 
 #[test]

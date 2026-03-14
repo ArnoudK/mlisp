@@ -4,32 +4,34 @@
 
 ### Core Semantics
 - [ ] Proper tail recursion as a real guarantee.
-- [ ] `apply`.
+  Tail positions are now lowered explicitly and matching direct/closure self-recursive calls are emitted as `tail call`, but full R7RS proper tail recursion still needs a statepoint-compatible calling-convention/trampoline rewrite.
+- [x] `apply` for known-signature user procedures and closures.
+- [x] First-class builtin procedures so primitives can participate in `apply`, `map`, and higher-order calls.
 - [x] Variadic procedures.
 - [x] Dotted parameter lists.
-- [ ] `equal?`.
-- [ ] Multiple values: `values`, `call-with-values`.
-- [ ] Exceptions: `error`, `raise`, `guard`.
+- [x] `equal?`.
+- [x] Multiple values: `values`, `call-with-values`.
+- [x] Exceptions: `error`, `raise`, `guard`.
 - [ ] Continuations: `call/cc`, `dynamic-wind`.
 
 ### Core Forms
-- [ ] `case`.
-- [ ] `do`.
-- [ ] `delay` / `force`.
+- [x] `case`.
+- [x] `do`.
+- [x] `delay` / `force`.
 
 ### Data Types And Procedures
-- [ ] Broader symbol procedures: `symbol->string`, `string->symbol`.
-- [ ] Broader character procedures: comparisons, ordering, case predicates, conversions.
+- [x] Broader symbol procedures: `symbol->string`, `string->symbol`.
+- [x] Broader character procedures: comparisons, ordering, case predicates, conversions.
 - [ ] Broader string procedures.
 - [ ] Broader vector procedures.
 - [ ] Bytevectors.
 - [ ] Stronger numeric tower coverage beyond tagged fixnums.
 
 ### List Library
-- [ ] `map`.
-- [ ] `for-each`.
-- [ ] `memq`, `memv`, `member`.
-- [ ] `assq`, `assv`, `assoc`.
+- [x] `map`.
+- [x] `for-each`.
+- [x] `memq`, `memv`, `member`.
+- [x] `assq`, `assv`, `assoc`.
 
 ### I/O
 - [ ] Input ports.
@@ -38,9 +40,9 @@
 - [ ] File procedures.
 
 ### Libraries And Macros
-- [ ] `define-library`.
-- [ ] `import`.
-- [ ] `define-syntax`.
+- [x] `define-library`.
+- [x] `import`.
+- [x] `define-syntax`.
 - [ ] `syntax-rules`.
 
 ## Runtime And Compiler Work
@@ -57,6 +59,7 @@
 
 ### Calling Convention
 - [ ] Improve dynamic procedure calling coverage.
+- [ ] Finish `apply` for all first-class procedures, not just known-signature user procedures/closures.
 - [ ] Support variadic and `apply`-driven call lowering.
 - [ ] Keep closure/runtime calling conventions consistent across more dynamic cases.
 
@@ -66,10 +69,5 @@
 - [ ] Add more multithreaded runtime/compiler integration tests.
 
 ## Recommended Next Order
-1. [ ] `apply`
-2. [ ] Variadic procedures and dotted parameters
-3. [ ] `equal?`
-4. [ ] Symbol and character procedure families
-5. [ ] `map`, `for-each`, and member/assoc procedures
-6. [ ] Proper tail recursion
-7. [ ] Macros and libraries
+1. [ ] Proper tail recursion
+2. [ ] Macros and libraries

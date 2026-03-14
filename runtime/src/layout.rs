@@ -19,6 +19,8 @@ pub const HEADER_TAG_STRING: u16 = 3;
 pub const HEADER_TAG_SYMBOL: u16 = 4;
 pub const HEADER_TAG_CLOSURE: u16 = 5;
 pub const HEADER_TAG_BOX: u16 = 6;
+pub const HEADER_TAG_VALUES: u16 = 7;
+pub const HEADER_TAG_PROMISE: u16 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]

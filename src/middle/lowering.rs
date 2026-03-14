@@ -177,11 +177,30 @@ impl Lowerer {
                 "let*" => return self.lower_let_form(&items[1..], LetFlavor::Sequential),
                 "letrec" => return self.lower_let_form(&items[1..], LetFlavor::Recursive),
                 "letrec*" => return self.lower_letrec_star_form(&items[1..]),
+                "guard" => return self.lower_guard_form(&items[1..]),
                 "and" => return self.lower_and_form(&items[1..]),
                 "or" => return self.lower_or_form(&items[1..]),
                 "when" => return self.lower_when_form(&items[1..], true),
                 "unless" => return self.lower_when_form(&items[1..], false),
                 "cond" => return self.lower_cond_form(&items[1..]),
+                "case" => return self.lower_case_form(&items[1..]),
+                "do" => return self.lower_do_form(&items[1..]),
+                "delay" => {
+                    if items.len() != 2 {
+                        return Err(CompileError::Lower(
+                            "delay expects exactly one expression".into(),
+                        ));
+                    }
+                    return Ok(ExprKind::Delay(Box::new(self.lower_expr(&items[1])?)));
+                }
+                "force" => {
+                    if items.len() != 2 {
+                        return Err(CompileError::Lower(
+                            "force expects exactly one expression".into(),
+                        ));
+                    }
+                    return Ok(ExprKind::Force(Box::new(self.lower_expr(&items[1])?)));
+                }
                 _ => {}
             }
         }
@@ -278,6 +297,120 @@ impl Lowerer {
         self.lower_cond_clauses(clauses)
     }
 
+    fn lower_case_form(&mut self, items: &[AstExpr]) -> Result<ExprKind, CompileError> {
+        if items.len() < 2 {
+            return Err(CompileError::Lower(
+                "case expects a key expression and at least one clause".into(),
+            ));
+        }
+        let key = self.lower_expr(&items[0])?;
+        let temp = self.gensym("case");
+        Ok(ExprKind::Let {
+            bindings: vec![Binding {
+                name: temp.clone(),
+                value: key,
+            }],
+            body: Box::new(Expr {
+                kind: self.lower_case_clauses(&temp, &items[1..])?,
+            }),
+        })
+    }
+
+    fn lower_do_form(&mut self, items: &[AstExpr]) -> Result<ExprKind, CompileError> {
+        if items.len() < 2 {
+            return Err(CompileError::Lower(
+                "do expects a binding list and a termination clause".into(),
+            ));
+        }
+
+        let bindings = match &items[0].kind {
+            AstExprKind::List { items: bindings, tail: None } => bindings
+                .iter()
+                .map(|binding| self.lower_do_binding(binding))
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(CompileError::Lower(
+                    "do bindings must be provided as a list".into(),
+                ));
+            }
+        };
+
+        let (test, result_exprs) = match &items[1].kind {
+            AstExprKind::List { items, tail: None } if !items.is_empty() => {
+                (self.lower_expr(&items[0])?, &items[1..])
+            }
+            _ => {
+                return Err(CompileError::Lower(
+                    "do termination clause must be a non-empty list".into(),
+                ));
+            }
+        };
+
+        let command_exprs = items[2..]
+            .iter()
+            .map(|expr| self.lower_expr(expr))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let loop_name = self.gensym("do_loop");
+        let formals = Formals {
+            required: bindings.iter().map(|binding| binding.name.clone()).collect(),
+            rest: None,
+        };
+        let done_expr = if result_exprs.is_empty() {
+            unspecified_expr()
+        } else {
+            self.lower_body(result_exprs)?
+        };
+        let step_args = bindings
+            .iter()
+            .map(|binding| {
+                binding
+                    .step
+                    .clone()
+                    .unwrap_or_else(|| variable_expr(&binding.name))
+            })
+            .collect::<Vec<_>>();
+        let recur_expr = Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(variable_expr(&loop_name)),
+                args: step_args,
+            },
+        };
+        let mut loop_body_exprs = command_exprs;
+        loop_body_exprs.push(recur_expr);
+        let loop_body = Expr {
+            kind: ExprKind::If {
+                condition: Box::new(test),
+                then_branch: Box::new(done_expr),
+                else_branch: Box::new(if loop_body_exprs.len() == 1 {
+                    loop_body_exprs.pop().expect("single do body expr")
+                } else {
+                    Expr {
+                        kind: ExprKind::Begin(loop_body_exprs),
+                    }
+                }),
+            },
+        };
+
+        Ok(ExprKind::LetRec {
+            bindings: vec![Binding {
+                name: loop_name.clone(),
+                value: Expr {
+                    kind: ExprKind::Lambda {
+                        formals,
+                        body: Box::new(loop_body),
+                    },
+                },
+            }],
+            body: Box::new(Expr {
+                kind: ExprKind::Call {
+                    callee: Box::new(variable_expr(&loop_name)),
+                    args: bindings.into_iter().map(|binding| binding.init).collect(),
+                },
+            }),
+        })
+    }
+
     fn lower_letrec_star_form(&mut self, items: &[AstExpr]) -> Result<ExprKind, CompileError> {
         if items.len() < 2 {
             return Err(CompileError::Lower(
@@ -299,6 +432,48 @@ impl Lowerer {
 
         let body = self.lower_body(&items[1..])?;
         self.nest_letrec_star(&bindings, body)
+    }
+
+    fn lower_guard_form(&mut self, items: &[AstExpr]) -> Result<ExprKind, CompileError> {
+        if items.len() < 2 {
+            return Err(CompileError::Lower(
+                "guard expects a clause specifier and at least one body expression".into(),
+            ));
+        }
+
+        let (name, clauses) = match &items[0].kind {
+            AstExprKind::List { items, tail: None } => {
+                let Some(first) = items.first() else {
+                    return Err(CompileError::Lower(
+                        "guard clause specifier must start with an exception variable".into(),
+                    ));
+                };
+                let name = match &first.kind {
+                    AstExprKind::Symbol(symbol) => symbol.clone(),
+                    _ => {
+                        return Err(CompileError::Lower(
+                            "guard exception variable must be a symbol".into(),
+                        ));
+                    }
+                };
+                (name, &items[1..])
+            }
+            _ => {
+                return Err(CompileError::Lower(
+                    "guard clause specifier must be a list".into(),
+                ));
+            }
+        };
+
+        let body = self.lower_body(&items[1..])?;
+        let handler = Expr {
+            kind: self.lower_guard_clauses(clauses, &name)?,
+        };
+        Ok(ExprKind::Guard {
+            name,
+            handler: Box::new(handler),
+            body: Box::new(body),
+        })
     }
 
     fn lower_cond_clauses(&mut self, clauses: &[AstExpr]) -> Result<ExprKind, CompileError> {
@@ -361,6 +536,171 @@ impl Lowerer {
                     condition: Box::new(variable_expr(&temp)),
                     then_branch: Box::new(then_expr),
                     else_branch: Box::new(else_expr),
+                },
+            }),
+        })
+    }
+
+    fn lower_guard_clauses(
+        &mut self,
+        clauses: &[AstExpr],
+        exception_name: &str,
+    ) -> Result<ExprKind, CompileError> {
+        let Some((first, rest)) = clauses.split_first() else {
+            return Ok(ExprKind::Call {
+                callee: Box::new(variable_expr("raise")),
+                args: vec![variable_expr(exception_name)],
+            });
+        };
+        let AstExprKind::List { items, tail: None } = &first.kind else {
+            return Err(CompileError::Lower("guard clause must be a list".into()));
+        };
+        if items.is_empty() {
+            return Err(CompileError::Lower("guard clause must not be empty".into()));
+        }
+
+        if matches!(&items[0].kind, AstExprKind::Symbol(symbol) if symbol == "else") {
+            if !rest.is_empty() {
+                return Err(CompileError::Lower(
+                    "guard else clause must be the last clause".into(),
+                ));
+            }
+            if items.len() < 2 {
+                return Err(CompileError::Lower(
+                    "guard else clause expects at least one body expression".into(),
+                ));
+            }
+            return Ok(self.lower_body(&items[1..])?.kind);
+        }
+
+        let test = self.lower_expr(&items[0])?;
+        let temp = self.gensym("guard");
+        let else_expr = Expr {
+            kind: self.lower_guard_clauses(rest, exception_name)?,
+        };
+
+        let then_expr = if items.len() == 1 {
+            variable_expr(&temp)
+        } else if matches!(&items[1].kind, AstExprKind::Symbol(symbol) if symbol == "=>") {
+            if items.len() != 3 {
+                return Err(CompileError::Lower(
+                    "guard => clause expects exactly one recipient expression".into(),
+                ));
+            }
+            let recipient = self.lower_expr(&items[2])?;
+            Expr {
+                kind: ExprKind::Call {
+                    callee: Box::new(recipient),
+                    args: vec![variable_expr(&temp)],
+                },
+            }
+        } else {
+            self.lower_body(&items[1..])?
+        };
+
+        Ok(ExprKind::Let {
+            bindings: vec![Binding {
+                name: temp.clone(),
+                value: test,
+            }],
+            body: Box::new(Expr {
+                kind: ExprKind::If {
+                    condition: Box::new(variable_expr(&temp)),
+                    then_branch: Box::new(then_expr),
+                    else_branch: Box::new(else_expr),
+                },
+            }),
+        })
+    }
+
+    fn lower_case_clauses(
+        &mut self,
+        key_name: &str,
+        clauses: &[AstExpr],
+    ) -> Result<ExprKind, CompileError> {
+        let Some((first, rest)) = clauses.split_first() else {
+            return Ok(ExprKind::Unspecified);
+        };
+        let AstExprKind::List { items, tail: None } = &first.kind else {
+            return Err(CompileError::Lower("case clause must be a list".into()));
+        };
+        if items.is_empty() {
+            return Err(CompileError::Lower("case clause must not be empty".into()));
+        }
+
+        if matches!(&items[0].kind, AstExprKind::Symbol(symbol) if symbol == "else") {
+            if !rest.is_empty() {
+                return Err(CompileError::Lower(
+                    "case else clause must be the last clause".into(),
+                ));
+            }
+            if items.len() < 2 {
+                return Err(CompileError::Lower(
+                    "case else clause expects at least one body expression".into(),
+                ));
+            }
+            return Ok(self.lower_body(&items[1..])?.kind);
+        }
+
+        let datums = match &items[0].kind {
+            AstExprKind::List { items: datums, tail: None } => datums
+                .iter()
+                .map(|datum| self.lower_datum(datum))
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(CompileError::Lower(
+                    "case clause datum list must be a proper list".into(),
+                ));
+            }
+        };
+        let test_temp = self.gensym("case_match");
+        let match_expr = Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(variable_expr("memv")),
+                args: vec![
+                    variable_expr(key_name),
+                    Expr {
+                        kind: ExprKind::Quote(Datum::List {
+                            items: datums,
+                            tail: None,
+                        }),
+                    },
+                ],
+            },
+        };
+        let then_expr = if items.len() == 1 {
+            return Err(CompileError::Lower(
+                "case clause expects at least one body expression".into(),
+            ));
+        } else if matches!(&items[1].kind, AstExprKind::Symbol(symbol) if symbol == "=>") {
+            if items.len() != 3 {
+                return Err(CompileError::Lower(
+                    "case => clause expects exactly one recipient expression".into(),
+                ));
+            }
+            let recipient = self.lower_expr(&items[2])?;
+            Expr {
+                kind: ExprKind::Call {
+                    callee: Box::new(recipient),
+                    args: vec![variable_expr(&test_temp)],
+                },
+            }
+        } else {
+            self.lower_body(&items[1..])?
+        };
+
+        Ok(ExprKind::Let {
+            bindings: vec![Binding {
+                name: test_temp.clone(),
+                value: match_expr,
+            }],
+            body: Box::new(Expr {
+                kind: ExprKind::If {
+                    condition: Box::new(variable_expr(&test_temp)),
+                    then_branch: Box::new(then_expr),
+                    else_branch: Box::new(Expr {
+                        kind: self.lower_case_clauses(key_name, rest)?,
+                    }),
                 },
             }),
         })
@@ -461,6 +801,33 @@ impl Lowerer {
         Ok(Binding { name, value })
     }
 
+    fn lower_do_binding(&mut self, expr: &AstExpr) -> Result<DoBinding, CompileError> {
+        let AstExprKind::List { items, tail: None } = &expr.kind else {
+            return Err(CompileError::Lower(
+                "do binding must be a list".into(),
+            ));
+        };
+        if !(2..=3).contains(&items.len()) {
+            return Err(CompileError::Lower(
+                "do binding must contain a variable, init expression, and optional step expression"
+                    .into(),
+            ));
+        }
+        let name = match &items[0].kind {
+            AstExprKind::Symbol(symbol) => symbol.clone(),
+            _ => {
+                return Err(CompileError::Lower(
+                    "do binding name must be a symbol".into(),
+                ));
+            }
+        };
+        Ok(DoBinding {
+            name,
+            init: self.lower_expr(&items[1])?,
+            step: items.get(2).map(|expr| self.lower_expr(expr)).transpose()?,
+        })
+    }
+
     fn lower_formals(
         &mut self,
         required: &[AstExpr],
@@ -517,6 +884,12 @@ enum LetFlavor {
     Parallel,
     Sequential,
     Recursive,
+}
+
+struct DoBinding {
+    name: String,
+    init: Expr,
+    step: Option<Expr>,
 }
 
 fn unspecified_expr() -> Expr {

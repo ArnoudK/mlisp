@@ -5,7 +5,7 @@ use mlisp::driver::run_path;
 
 #[test]
 fn runs_file_based_end_to_end_cases() {
-    let root = Path::new("/home/du/code/mlisp/tests/e2e");
+    let root = Path::new("./tests/e2e");
     let mut cases = fs::read_dir(root)
         .unwrap()
         .filter_map(Result::ok)

@@ -28,13 +28,13 @@ entry:
 ```
 
 The exact fixture is checked into
-[examples/llvm/statepoint_example.ll](/home/du/code/mlisp/examples/llvm/statepoint_example.ll).
+[examples/llvm/statepoint_example.ll](./examples/llvm/statepoint_example.ll).
 
 For the safepoint-placement pipeline, the repo also includes a pre-statepoint
 input fixture in
-[examples/llvm/place_safepoints_input.ll](/home/du/code/mlisp/examples/llvm/place_safepoints_input.ll)
+[examples/llvm/place_safepoints_input.ll](./examples/llvm/place_safepoints_input.ll)
 and a helper script in
-[scripts/verify-statepoint-pipeline.sh](/home/du/code/mlisp/scripts/verify-statepoint-pipeline.sh)
+[scripts/verify-statepoint-pipeline.sh](./scripts/verify-statepoint-pipeline.sh)
 that runs:
 
 ```bash
