@@ -11,9 +11,25 @@ pub enum TopLevel {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Formals {
+    pub required: Vec<String>,
+    pub rest: Option<String>,
+}
+
+impl Formals {
+    pub fn all_names(&self) -> Vec<String> {
+        let mut names = self.required.clone();
+        if let Some(rest) = &self.rest {
+            names.push(rest.clone());
+        }
+        names
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Procedure {
     pub name: String,
-    pub params: Vec<String>,
+    pub formals: Formals,
     pub body: Expr,
 }
 
@@ -51,13 +67,20 @@ pub enum ExprKind {
         bindings: Vec<Binding>,
         body: Box<Expr>,
     },
+    Guard {
+        name: String,
+        handler: Box<Expr>,
+        body: Box<Expr>,
+    },
+    Delay(Box<Expr>),
+    Force(Box<Expr>),
     If {
         condition: Box<Expr>,
         then_branch: Box<Expr>,
         else_branch: Box<Expr>,
     },
     Lambda {
-        params: Vec<String>,
+        formals: Formals,
         body: Box<Expr>,
     },
     Quote(Datum),
@@ -76,5 +99,8 @@ pub enum Datum {
     Char(char),
     String(String),
     Symbol(String),
-    List(Vec<Datum>),
+    List {
+        items: Vec<Datum>,
+        tail: Option<Box<Datum>>,
+    },
 }

@@ -1,6 +1,6 @@
 use crate::layout::{
-    BOOL_FALSE, BOOL_TRUE, CHAR_SHIFT, CHAR_TAG, EMPTY_LIST, FIXNUM_SHIFT, FIXNUM_TAG, HEAP_REF_TAG,
-    IMMEDIATE_TAG_MASK, UNSPECIFIED,
+    BOOL_FALSE, BOOL_TRUE, CHAR_SHIFT, CHAR_TAG, EMPTY_LIST, FIXNUM_SHIFT, FIXNUM_TAG,
+    HEAP_REF_TAG, IMMEDIATE_TAG_MASK, TAIL_CALL_MARKER, UNSPECIFIED,
 };
 use mmtk::util::{Address, ObjectReference};
 
@@ -14,6 +14,7 @@ pub enum Immediate {
     Char(char),
     EmptyList,
     Unspecified,
+    TailCallMarker,
 }
 
 impl Value {
@@ -51,6 +52,10 @@ impl Value {
 
     pub const fn unspecified() -> Self {
         Self(UNSPECIFIED)
+    }
+
+    pub const fn tail_call_marker() -> Self {
+        Self(TAIL_CALL_MARKER)
     }
 
     pub fn encode_char(value: char) -> Self {
@@ -102,6 +107,7 @@ impl Value {
             BOOL_TRUE => Some(Immediate::Bool(true)),
             EMPTY_LIST => Some(Immediate::EmptyList),
             UNSPECIFIED => Some(Immediate::Unspecified),
+            TAIL_CALL_MARKER => Some(Immediate::TailCallMarker),
             _ => None,
         }
     }
@@ -138,6 +144,10 @@ mod tests {
         assert_eq!(
             Value::unspecified().decode_immediate(),
             Some(Immediate::Unspecified)
+        );
+        assert_eq!(
+            Value::tail_call_marker().decode_immediate(),
+            Some(Immediate::TailCallMarker)
         );
         assert_eq!(
             Value::encode_char('x').decode_immediate(),

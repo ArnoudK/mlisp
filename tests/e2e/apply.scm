@@ -1,0 +1,20 @@
+(define (add3 a b c)
+  (+ a (+ b c)))
+
+(define (tail x . rest)
+  rest)
+
+(display (apply add3 '(1 2 3)))
+(newline)
+(write (apply tail 1 '(2 3)))
+(newline)
+(display (let ((f (lambda (a b c) (+ a (+ b c)))))
+           (apply f '(1 2 3))))
+(newline)
+(display (let ((f +))
+           (f 1 2 3)))
+(newline)
+(display (let ((f +))
+           (apply f '(1 2 3))))
+(newline)
+0

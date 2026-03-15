@@ -47,6 +47,15 @@ To exercise the MMTk runtime prototype with StickyImmix and bound mutator thread
 cargo run -- runtime-stress --threads 2 --iterations 256
 ```
 
+To reuse the vendored Chibi basic fixtures against `mlisp`:
+
+```bash
+scripts/run-chibi-tests.sh
+```
+
+That script runs the full `chibi-scheme/tests/basic` directory by default and
+also accepts explicit fixture names such as `test06-letrec`.
+
 Runtime direction:
 
 - Tagged `Value` representation for immediates and heap references

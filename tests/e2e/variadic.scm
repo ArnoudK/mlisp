@@ -1,0 +1,13 @@
+(write ((lambda args args) 1 2 3))
+(newline)
+(write ((lambda (x y . rest) rest) 1 2 3 4))
+(newline)
+(define (keep-first x . rest) x)
+(display (keep-first 7 8 9))
+(newline)
+(define (tail-list x . rest) rest)
+(write (tail-list 7 8 9))
+(newline)
+(write '(1 . 2))
+(newline)
+0

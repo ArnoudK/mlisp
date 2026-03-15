@@ -11,6 +11,7 @@ pub struct Token {
 pub enum TokenKind {
     LParen,
     RParen,
+    Dot,
     Quote,
     Integer(i64),
     Boolean(bool),
@@ -48,6 +49,16 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
             b')' => {
                 tokens.push(Token {
                     kind: TokenKind::RParen,
+                    span: Span {
+                        start: index,
+                        end: index + 1,
+                    },
+                });
+                index += 1;
+            }
+            b'.' if index + 1 == bytes.len() || is_delimiter(bytes[index + 1]) => {
+                tokens.push(Token {
+                    kind: TokenKind::Dot,
                     span: Span {
                         start: index,
                         end: index + 1,
@@ -138,9 +149,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                         b'\\' => {
                             index += 1;
                             if index >= bytes.len() {
-                                return Err(CompileError::Lex(
-                                    "unterminated string escape".into(),
-                                ));
+                                return Err(CompileError::Lex("unterminated string escape".into()));
                             }
                             let escaped = match bytes[index] {
                                 b'"' => '"',
@@ -165,7 +174,10 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                     }
                 }
 
-                if !matches!(tokens.last().map(|token| &token.kind), Some(TokenKind::String(_))) {
+                if !matches!(
+                    tokens.last().map(|token| &token.kind),
+                    Some(TokenKind::String(_))
+                ) {
                     return Err(CompileError::Lex(format!(
                         "unterminated string literal starting at byte {start}"
                     )));

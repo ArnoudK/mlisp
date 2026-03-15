@@ -56,7 +56,7 @@ fn safepoint_pipeline_rewrites_pre_statepoint_fixture() {
     ));
     fs::create_dir_all(&root).unwrap();
 
-    let input = "/home/du/code/mlisp/examples/llvm/place_safepoints_input.ll";
+    let input = "./examples/llvm/place_safepoints_input.ll";
     let output = root.join("place_safepoints_output.ll");
 
     let rewrite = Command::new("opt")

@@ -48,6 +48,10 @@ impl Parser {
                 kind: ExprKind::String(value),
                 span: token.span,
             }),
+            TokenKind::Dot => Err(CompileError::Parse(format!(
+                "unexpected '.' at byte {}",
+                token.span.start
+            ))),
             TokenKind::Symbol(symbol) => Ok(Expr {
                 kind: ExprKind::Symbol(symbol),
                 span: token.span,
@@ -69,6 +73,7 @@ impl Parser {
 
     fn parse_list(&mut self, start: usize) -> Result<Expr, CompileError> {
         let mut items = Vec::new();
+        let mut tail = None;
         loop {
             let Some(token) = self.peek() else {
                 return Err(CompileError::Parse(format!(
@@ -80,9 +85,29 @@ impl Parser {
                 let end = token.span.end;
                 self.cursor += 1;
                 return Ok(Expr {
-                    kind: ExprKind::List(items),
+                    kind: ExprKind::List { items, tail },
                     span: Span { start, end },
                 });
+            }
+
+            if matches!(token.kind, TokenKind::Dot) {
+                if items.is_empty() || tail.is_some() {
+                    return Err(CompileError::Parse(format!(
+                        "invalid dotted list syntax at byte {}",
+                        token.span.start
+                    )));
+                }
+                self.cursor += 1;
+                let tail_expr = self.parse_expr()?;
+                tail = Some(Box::new(tail_expr));
+                continue;
+            }
+
+            if tail.is_some() {
+                return Err(CompileError::Parse(format!(
+                    "dotted list must end after tail expression at byte {}",
+                    token.span.start
+                )));
             }
 
             items.push(self.parse_expr()?);

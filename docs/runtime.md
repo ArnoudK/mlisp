@@ -28,8 +28,8 @@ Current immediate set:
 - `'()`
 - unspecified result
 
-This is defined in [src/runtime/layout.rs](/home/du/code/mlisp/src/runtime/layout.rs) and
-[src/runtime/value.rs](/home/du/code/mlisp/src/runtime/value.rs).
+This is defined in [src/runtime/layout.rs](./src/runtime/layout.rs) and
+[src/runtime/value.rs](./src/runtime/value.rs).
 
 ## Heap Objects
 
@@ -59,7 +59,7 @@ dependency yet. The project now defines:
 - a `GarbageCollector` trait for runtime allocation entrypoints
 - an `MmtkRuntime` plan type describing roots and allocation assumptions
 
-See [src/runtime/mmtk.rs](/home/du/code/mlisp/src/runtime/mmtk.rs).
+See [src/runtime/mmtk.rs](./src/runtime/mmtk.rs).
 
 The expected runtime shape for real MMTk integration is:
 
@@ -69,8 +69,8 @@ The expected runtime shape for real MMTk integration is:
 4. Generated code treats heap references as movable and reloadable values.
 
 The project now includes a concrete host ABI scaffold in
-[src/runtime/abi.rs](/home/du/code/mlisp/src/runtime/abi.rs) and LLVM-side
-declarations in [src/backend/runtime.rs](/home/du/code/mlisp/src/backend/runtime.rs).
+[src/runtime/abi.rs](./src/runtime/abi.rs) and LLVM-side
+declarations in [src/backend/runtime.rs](./src/backend/runtime.rs).
 The current allocator is intentionally a stub backed by Rust heap allocation so
 the ABI can stabilize before the collector is swapped to MMTk.
 
@@ -88,7 +88,7 @@ Planned compiler/runtime contract:
 - Closure conversion materializes captured locals into heap environments.
 
 For the statepoint-specific lowering direction, see
-[docs/statepoints.md](/home/du/code/mlisp/docs/statepoints.md).
+[docs/statepoints.md](./docs/statepoints.md).
 
 ## Next Runtime Steps
 

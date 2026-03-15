@@ -1,6 +1,9 @@
 use crate::error::RuntimeError;
 use crate::layout::{ALIGNMENT, ObjectHeader};
-use crate::object::{BoxObject, ClosureObject, HeapKind, PairObject, StringObject, SymbolObject, VectorObject};
+use crate::object::{
+    BoxObject, ClosureObject, HeapKind, PairObject, PromiseObject, StringObject, SymbolObject,
+    ValuesObject, VectorObject,
+};
 use crate::value::Value;
 use mmtk::memory_manager;
 use mmtk::plan::{AllocationSemantics, Mutator};
@@ -14,12 +17,12 @@ use mmtk::vm::{
     ActivePlan, Collection, GCThreadContext, ObjectModel, ReferenceGlue, RootsWorkFactory,
     Scanning, SlotVisitor, VMBinding,
 };
-use mmtk::{MMTKBuilder, MMTK};
+use mmtk::{MMTK, MMTKBuilder};
 use std::cell::Cell;
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 thread_local! {
@@ -95,7 +98,11 @@ impl MemorySlice for ValueMemorySlice {
     fn copy(src: &Self, dst: &Self) {
         assert_eq!(src.words, dst.words);
         unsafe {
-            ptr::copy_nonoverlapping(src.start as *const usize, dst.start as *mut usize, src.words)
+            ptr::copy_nonoverlapping(
+                src.start as *const usize,
+                dst.start as *mut usize,
+                src.words,
+            )
         };
     }
 }
@@ -164,6 +171,12 @@ struct ThreadContext {
     tls: VMMutatorThread,
     mutator: *mut Mutator<MlispVM>,
     roots: Mutex<Vec<usize>>,
+    pending_exception: SharedRoot,
+    has_pending_exception: AtomicBool,
+    pending_tail_code: AtomicUsize,
+    pending_tail_closure: SharedRoot,
+    pending_tail_args: SharedRoot,
+    has_pending_tail: AtomicBool,
     blocked_epoch: AtomicU64,
     active: AtomicBool,
 }
@@ -185,6 +198,32 @@ impl SharedRoot {
     }
 }
 
+struct RootStackGuard {
+    thread: *mut core::ffi::c_void,
+    count: usize,
+}
+
+impl RootStackGuard {
+    fn new(thread: *mut core::ffi::c_void) -> Self {
+        Self { thread, count: 0 }
+    }
+
+    fn push(&mut self, slot: *mut usize) -> Result<(), RuntimeError> {
+        push_root_checked(self.thread, slot)?;
+        self.count += 1;
+        Ok(())
+    }
+}
+
+impl Drop for RootStackGuard {
+    fn drop(&mut self) {
+        while self.count > 0 {
+            let _ = pop_root_checked(self.thread);
+            self.count -= 1;
+        }
+    }
+}
+
 fn runtime() -> &'static RuntimeState {
     RUNTIME.get().ok_or(RuntimeError::NotInitialized).unwrap()
 }
@@ -193,10 +232,7 @@ fn runtime_mmtk() -> &'static MMTK<MlispVM> {
     if let Some(runtime) = RUNTIME.get() {
         runtime.mmtk
     } else {
-        *INIT_MMTK
-            .get()
-            .ok_or(RuntimeError::NotInitialized)
-            .unwrap()
+        *INIT_MMTK.get().ok_or(RuntimeError::NotInitialized).unwrap()
     }
 }
 
@@ -205,7 +241,9 @@ fn runtime_checked() -> Result<&'static RuntimeState, RuntimeError> {
 }
 
 fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn wait_unpoison<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
@@ -244,10 +282,7 @@ fn ctx_from_vm_thread_checked(tls: VMThread) -> Result<&'static ThreadContext, R
     Ok(unsafe { &*ptr })
 }
 
-fn ensure_initialized(
-    heap_size_bytes: usize,
-    worker_count: usize,
-) -> &'static RuntimeState {
+fn ensure_initialized(heap_size_bytes: usize, worker_count: usize) -> &'static RuntimeState {
     RUNTIME.get_or_init(|| {
         let mut builder = MMTKBuilder::new();
         builder.options.plan.set(PlanSelector::StickyImmix);
@@ -296,11 +331,19 @@ fn bind_current_thread() -> *mut ThreadContext {
         tls: VMMutatorThread(VMThread(OpaquePointer::UNINITIALIZED)),
         mutator: ptr::null_mut(),
         roots: Mutex::new(Vec::new()),
+        pending_exception: SharedRoot::new(),
+        has_pending_exception: AtomicBool::new(false),
+        pending_tail_code: AtomicUsize::new(0),
+        pending_tail_closure: SharedRoot::new(),
+        pending_tail_args: SharedRoot::new(),
+        has_pending_tail: AtomicBool::new(false),
         blocked_epoch: AtomicU64::new(0),
         active: AtomicBool::new(true),
     });
     let raw = Box::into_raw(context);
-    let tls = VMMutatorThread(VMThread(OpaquePointer::from_address(Address::from_mut_ptr(raw))));
+    let tls = VMMutatorThread(VMThread(OpaquePointer::from_address(
+        Address::from_mut_ptr(raw),
+    )));
     let mutator = Box::into_raw(memory_manager::bind_mutator(runtime.mmtk, tls));
 
     unsafe {
@@ -398,6 +441,12 @@ pub fn alloc_pair(car: Value, cdr: Value) -> ObjectReference {
 }
 
 pub fn alloc_pair_checked(car: Value, cdr: Value) -> Result<ObjectReference, RuntimeError> {
+    let thread = current_thread();
+    let mut rooted_car = car.bits();
+    let mut rooted_cdr = cdr.bits();
+    let mut roots = RootStackGuard::new(thread);
+    roots.push(&mut rooted_car)?;
+    roots.push(&mut rooted_cdr)?;
     let object = alloc_raw_checked(
         core::mem::size_of::<PairObject>(),
         core::mem::align_of::<PairObject>(),
@@ -405,8 +454,8 @@ pub fn alloc_pair_checked(car: Value, cdr: Value) -> Result<ObjectReference, Run
     )?;
     unsafe {
         let pair = object.to_raw_address().to_mut_ptr::<PairObject>();
-        (*pair).car = car.bits();
-        (*pair).cdr = cdr.bits();
+        (*pair).car = rooted_car;
+        (*pair).cdr = rooted_cdr;
     }
     Ok(object)
 }
@@ -416,6 +465,10 @@ pub fn alloc_box(value: Value) -> ObjectReference {
 }
 
 pub fn alloc_box_checked(value: Value) -> Result<ObjectReference, RuntimeError> {
+    let thread = current_thread();
+    let mut rooted_value = value.bits();
+    let mut roots = RootStackGuard::new(thread);
+    roots.push(&mut rooted_value)?;
     let object = alloc_raw_checked(
         core::mem::size_of::<BoxObject>(),
         core::mem::align_of::<BoxObject>(),
@@ -423,7 +476,7 @@ pub fn alloc_box_checked(value: Value) -> Result<ObjectReference, RuntimeError> 
     )?;
     unsafe {
         let boxed = object.to_raw_address().to_mut_ptr::<BoxObject>();
-        (*boxed).value = value.bits();
+        (*boxed).value = rooted_value;
     }
     Ok(object)
 }
@@ -436,6 +489,12 @@ pub fn alloc_closure_checked(
     code_ptr: usize,
     env: &[Value],
 ) -> Result<ObjectReference, RuntimeError> {
+    let thread = current_thread();
+    let mut rooted_env = env.to_vec();
+    let mut roots = RootStackGuard::new(thread);
+    for value in &mut rooted_env {
+        roots.push(&mut value.0)?;
+    }
     let size = core::mem::size_of::<ClosureObject>() + (env.len() * core::mem::size_of::<usize>());
     let object = alloc_raw_checked(
         size,
@@ -446,9 +505,9 @@ pub fn alloc_closure_checked(
         let closure = object.to_raw_address().to_mut_ptr::<ClosureObject>();
         ptr::write(closure, ClosureObject::new(code_ptr, env.len(), size));
         ptr::copy_nonoverlapping(
-            env.as_ptr().cast::<usize>(),
+            rooted_env.as_ptr().cast::<usize>(),
             (*closure).env_mut_ptr(),
-            env.len(),
+            rooted_env.len(),
         );
     }
     Ok(object)
@@ -485,7 +544,14 @@ pub fn alloc_symbol_checked(bytes: &[u8]) -> Result<ObjectReference, RuntimeErro
 }
 
 pub fn alloc_vector_checked(elements: &[Value]) -> Result<ObjectReference, RuntimeError> {
-    let size = core::mem::size_of::<VectorObject>() + (elements.len() * core::mem::size_of::<usize>());
+    let thread = current_thread();
+    let mut rooted_elements = elements.to_vec();
+    let mut roots = RootStackGuard::new(thread);
+    for value in &mut rooted_elements {
+        roots.push(&mut value.0)?;
+    }
+    let size =
+        core::mem::size_of::<VectorObject>() + (elements.len() * core::mem::size_of::<usize>());
     let object = alloc_raw_checked(
         size,
         core::mem::align_of::<VectorObject>(),
@@ -495,10 +561,53 @@ pub fn alloc_vector_checked(elements: &[Value]) -> Result<ObjectReference, Runti
         let vector = object.to_raw_address().to_mut_ptr::<VectorObject>();
         ptr::write(vector, VectorObject::new(elements.len(), size));
         ptr::copy_nonoverlapping(
-            elements.as_ptr().cast::<usize>(),
+            rooted_elements.as_ptr().cast::<usize>(),
             (*vector).elements_mut_ptr(),
-            elements.len(),
+            rooted_elements.len(),
         );
+    }
+    Ok(object)
+}
+
+pub fn alloc_values_checked(elements: &[Value]) -> Result<ObjectReference, RuntimeError> {
+    let thread = current_thread();
+    let mut rooted_elements = elements.to_vec();
+    let mut roots = RootStackGuard::new(thread);
+    for value in &mut rooted_elements {
+        roots.push(&mut value.0)?;
+    }
+    let size =
+        core::mem::size_of::<ValuesObject>() + (elements.len() * core::mem::size_of::<usize>());
+    let object = alloc_raw_checked(
+        size,
+        core::mem::align_of::<ValuesObject>(),
+        HeapKind::Values.as_tag(),
+    )?;
+    unsafe {
+        let values = object.to_raw_address().to_mut_ptr::<ValuesObject>();
+        ptr::write(values, ValuesObject::new(elements.len(), size));
+        ptr::copy_nonoverlapping(
+            rooted_elements.as_ptr().cast::<usize>(),
+            (*values).elements_mut_ptr(),
+            rooted_elements.len(),
+        );
+    }
+    Ok(object)
+}
+
+pub fn alloc_promise_checked(value: Value) -> Result<ObjectReference, RuntimeError> {
+    let thread = current_thread();
+    let mut rooted_value = value.bits();
+    let mut roots = RootStackGuard::new(thread);
+    roots.push(&mut rooted_value)?;
+    let object = alloc_raw_checked(
+        core::mem::size_of::<PromiseObject>(),
+        core::mem::align_of::<PromiseObject>(),
+        HeapKind::Promise.as_tag(),
+    )?;
+    unsafe {
+        let promise = object.to_raw_address().to_mut_ptr::<PromiseObject>();
+        ptr::write(promise, PromiseObject::new(Value::from_bits(rooted_value)));
     }
     Ok(object)
 }
@@ -516,13 +625,15 @@ pub fn object_write_post_checked(
         return Err(RuntimeError::NullSlot);
     }
     unsafe { ptr::write(slot, target.bits()) };
-    let thread = current_thread_context_checked()?;
-    memory_manager::object_reference_write_post(
-        unsafe { &mut *thread.mutator },
-        src,
-        ValueSlot::from_ptr(slot),
-        target.to_object_reference(),
-    );
+    if target.is_heap_ref() {
+        let thread = current_thread_context_checked()?;
+        memory_manager::object_reference_write_post(
+            unsafe { &mut *thread.mutator },
+            src,
+            ValueSlot::from_ptr(slot),
+            target.to_object_reference(),
+        );
+    }
     Ok(())
 }
 
@@ -552,30 +663,31 @@ pub fn run_mutator_stress_checked(
         let shared = Arc::clone(&shared);
         handles.push(thread::spawn(move || {
             let worker = || -> Result<(), RuntimeError> {
-            let thread = bind_current_thread();
-            let mut local_root = 0usize;
-            push_root_checked(thread.cast(), &mut local_root)?;
-            for iteration in 0..iterations {
-                gc_poll_current_checked()?;
-                let object = alloc_pair(
-                    Value::encode_fixnum(index as i64).ok_or(RuntimeError::FixnumOutOfRange)?,
-                    Value::encode_fixnum(iteration as i64).ok_or(RuntimeError::FixnumOutOfRange)?,
-                );
-                local_root = object.to_raw_address().as_usize();
-                let slot_ptr = shared[index].as_ptr();
-                unsafe {
-                    let pair = object.to_raw_address().to_mut_ptr::<PairObject>();
-                    object_write_post_checked(
-                        object,
-                        ptr::addr_of_mut!((*pair).cdr),
-                        Value::from_bits(*slot_ptr),
-                    )?;
+                let thread = bind_current_thread();
+                let mut local_root = 0usize;
+                push_root_checked(thread.cast(), &mut local_root)?;
+                for iteration in 0..iterations {
+                    gc_poll_current_checked()?;
+                    let object = alloc_pair(
+                        Value::encode_fixnum(index as i64).ok_or(RuntimeError::FixnumOutOfRange)?,
+                        Value::encode_fixnum(iteration as i64)
+                            .ok_or(RuntimeError::FixnumOutOfRange)?,
+                    );
+                    local_root = object.to_raw_address().as_usize();
+                    let slot_ptr = shared[index].as_ptr();
+                    unsafe {
+                        let pair = object.to_raw_address().to_mut_ptr::<PairObject>();
+                        object_write_post_checked(
+                            object,
+                            ptr::addr_of_mut!((*pair).cdr),
+                            Value::from_bits(*slot_ptr),
+                        )?;
+                    }
+                    unsafe { ptr::write(slot_ptr, local_root) };
                 }
-                unsafe { ptr::write(slot_ptr, local_root) };
-            }
-            pop_root_checked(thread.cast())?;
-            unsafe { unbind_thread(thread) };
-            Ok(())
+                pop_root_checked(thread.cast())?;
+                unsafe { unbind_thread(thread) };
+                Ok(())
             };
             worker()
         }));
@@ -593,11 +705,15 @@ pub fn run_mutator_stress_checked(
 pub fn gc_stress_checked(iterations: usize) -> Result<(), RuntimeError> {
     let thread = current_thread_context_checked()?;
     let mut local_root = 0usize;
-    push_root_checked(thread as *const ThreadContext as *mut core::ffi::c_void, &mut local_root)?;
+    push_root_checked(
+        thread as *const ThreadContext as *mut core::ffi::c_void,
+        &mut local_root,
+    )?;
 
     for iteration in 0..iterations {
         gc_poll_current_checked()?;
-        let fixnum = Value::encode_fixnum(iteration as i64).ok_or(RuntimeError::FixnumOutOfRange)?;
+        let fixnum =
+            Value::encode_fixnum(iteration as i64).ok_or(RuntimeError::FixnumOutOfRange)?;
         let string = alloc_string_checked(b"gc")?;
         let vector = alloc_vector_checked(&[
             fixnum,
@@ -616,6 +732,66 @@ pub fn gc_stress_checked(iterations: usize) -> Result<(), RuntimeError> {
 
     pop_root_checked(thread as *const ThreadContext as *mut core::ffi::c_void)?;
     Ok(())
+}
+
+pub fn exception_pending_checked() -> Result<bool, RuntimeError> {
+    Ok(current_thread_context_checked()?
+        .has_pending_exception
+        .load(Ordering::SeqCst))
+}
+
+pub fn raise_checked(value: Value) -> Result<(), RuntimeError> {
+    let thread = current_thread_context_checked()?;
+    unsafe {
+        ptr::write(thread.pending_exception.as_ptr(), value.bits());
+    }
+    thread.has_pending_exception.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+pub fn take_pending_exception_checked() -> Result<Value, RuntimeError> {
+    let thread = current_thread_context_checked()?;
+    if !thread.has_pending_exception.swap(false, Ordering::SeqCst) {
+        return Ok(Value::unspecified());
+    }
+    Ok(Value::from_bits(unsafe {
+        ptr::read(thread.pending_exception.as_ptr())
+    }))
+}
+
+pub fn tail_call_pending_checked() -> Result<bool, RuntimeError> {
+    Ok(current_thread_context_checked()?
+        .has_pending_tail
+        .load(Ordering::SeqCst))
+}
+
+pub fn request_tail_call_checked(
+    code_ptr: usize,
+    closure: Value,
+    args: Value,
+) -> Result<(), RuntimeError> {
+    let thread = current_thread_context_checked()?;
+    thread.pending_tail_code.store(code_ptr, Ordering::SeqCst);
+    unsafe {
+        ptr::write(thread.pending_tail_closure.as_ptr(), closure.bits());
+        ptr::write(thread.pending_tail_args.as_ptr(), args.bits());
+    }
+    thread.has_pending_tail.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+pub fn take_pending_tail_call_checked() -> Result<Option<(usize, Value, Value)>, RuntimeError> {
+    let thread = current_thread_context_checked()?;
+    if !thread.has_pending_tail.swap(false, Ordering::SeqCst) {
+        return Ok(None);
+    }
+    let code = thread.pending_tail_code.swap(0, Ordering::SeqCst);
+    if code == 0 {
+        return Err(RuntimeError::InvalidTrampolineState);
+    }
+    let closure = Value::from_bits(unsafe { ptr::read(thread.pending_tail_closure.as_ptr()) });
+    let args = Value::from_bits(unsafe { ptr::read(thread.pending_tail_args.as_ptr()) });
+    Ok(Some((code, closure, args)))
 }
 
 pub fn push_root_checked(
@@ -679,11 +855,7 @@ impl ActivePlan<MlispVM> for MlispVM {
                 }
             })
             .collect();
-        Box::new(
-            pointers
-                .into_iter()
-                .map(|ptr| unsafe { &mut *ptr }),
-        )
+        Box::new(pointers.into_iter().map(|ptr| unsafe { &mut *ptr }))
     }
 
     fn number_of_mutators() -> usize {
@@ -780,14 +952,30 @@ impl Scanning<MlispVM> for MlispVM {
                 tag if tag == HeapKind::Closure.as_tag() => {
                     let closure = object.to_raw_address().to_mut_ptr::<ClosureObject>();
                     for index in 0..(*closure).env_len {
-                        slot_visitor.visit_slot(ValueSlot::from_ptr((*closure).env_mut_ptr().add(index)));
+                        slot_visitor
+                            .visit_slot(ValueSlot::from_ptr((*closure).env_mut_ptr().add(index)));
                     }
                 }
                 tag if tag == HeapKind::Vector.as_tag() => {
                     let vector = object.to_raw_address().to_mut_ptr::<VectorObject>();
                     for index in 0..(*vector).length {
-                        slot_visitor.visit_slot(ValueSlot::from_ptr((*vector).elements_mut_ptr().add(index)));
+                        slot_visitor.visit_slot(ValueSlot::from_ptr(
+                            (*vector).elements_mut_ptr().add(index),
+                        ));
                     }
+                }
+                tag if tag == HeapKind::Values.as_tag() => {
+                    let values = object.to_raw_address().to_mut_ptr::<ValuesObject>();
+                    for index in 0..(*values).length {
+                        slot_visitor.visit_slot(ValueSlot::from_ptr(
+                            (*values).elements_mut_ptr().add(index),
+                        ));
+                    }
+                }
+                tag if tag == HeapKind::Promise.as_tag() => {
+                    let promise = object.to_raw_address().to_mut_ptr::<PromiseObject>();
+                    slot_visitor
+                        .visit_slot(ValueSlot::from_ptr(ptr::addr_of_mut!((*promise).value)));
                 }
                 tag if tag == HeapKind::String.as_tag() || tag == HeapKind::Symbol.as_tag() => {}
                 _ => {}
@@ -810,6 +998,17 @@ impl Scanning<MlispVM> for MlispVM {
                 .map(|slot| ValueSlot::from_ptr(slot as *mut usize))
                 .collect(),
         );
+        if thread.has_pending_exception.load(Ordering::SeqCst) {
+            factory.create_process_roots_work(vec![ValueSlot::from_ptr(
+                thread.pending_exception.as_ptr(),
+            )]);
+        }
+        if thread.has_pending_tail.load(Ordering::SeqCst) {
+            factory.create_process_roots_work(vec![
+                ValueSlot::from_ptr(thread.pending_tail_closure.as_ptr()),
+                ValueSlot::from_ptr(thread.pending_tail_args.as_ptr()),
+            ]);
+        }
     }
 
     fn scan_vm_specific_roots(_tls: VMWorkerThread, mut factory: impl RootsWorkFactory<ValueSlot>) {

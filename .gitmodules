@@ -1,3 +1,6 @@
 [submodule "r7rs"]
 	path = r7rs
 	url = https://codeberg.org/scheme/r7rs.git
+[submodule "chibi-scheme"]
+	path = chibi-scheme
+	url = https://github.com/ashinn/chibi-scheme

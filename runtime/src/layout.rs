@@ -10,6 +10,7 @@ pub const BOOL_FALSE: usize = 0b0000_0010;
 pub const BOOL_TRUE: usize = 0b0000_0110;
 pub const EMPTY_LIST: usize = 0b0000_1010;
 pub const UNSPECIFIED: usize = 0b0000_1110;
+pub const TAIL_CALL_MARKER: usize = 0b0001_0010;
 pub const CHAR_TAG: usize = 0b100;
 pub const CHAR_SHIFT: usize = 3;
 
@@ -19,6 +20,8 @@ pub const HEADER_TAG_STRING: u16 = 3;
 pub const HEADER_TAG_SYMBOL: u16 = 4;
 pub const HEADER_TAG_CLOSURE: u16 = 5;
 pub const HEADER_TAG_BOX: u16 = 6;
+pub const HEADER_TAG_VALUES: u16 = 7;
+pub const HEADER_TAG_PROMISE: u16 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]

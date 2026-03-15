@@ -37,9 +37,10 @@ pub fn compile_pre_statepoint_example(module_name: &str) -> Result<CompiledModul
     module.add_function("rt_gc_poll", void_type.fn_type(&[], false), None);
     let alloc_slow_raw = module.add_function(
         "rt_alloc_slow",
-        context
-            .ptr_type(AddressSpace::default())
-            .fn_type(&[word_type.into(), word_type.into(), kind_type.into()], false),
+        context.ptr_type(AddressSpace::default()).fn_type(
+            &[word_type.into(), word_type.into(), kind_type.into()],
+            false,
+        ),
         None,
     );
     let alloc_slow = build_alloc_slow_wrapper(&context, &module, &builder, alloc_slow_raw)?;
@@ -125,7 +126,10 @@ fn build_alloc_slow_wrapper<'ctx>(
     let kind_type = context.i16_type();
     let wrapper = module.add_function(
         "rt_alloc_slow_as1",
-        gc_ptr.fn_type(&[word_type.into(), word_type.into(), kind_type.into()], false),
+        gc_ptr.fn_type(
+            &[word_type.into(), word_type.into(), kind_type.into()],
+            false,
+        ),
         None,
     );
     let entry = context.append_basic_block(wrapper, "entry");
@@ -221,7 +225,11 @@ mod tests {
         let module = compile_pre_statepoint_example("gc_example").unwrap();
         assert!(module.llvm_ir.contains("define void @gc.safepoint_poll()"));
         assert!(module.llvm_ir.contains("declare void @gc_safepoint_poll()"));
-        assert!(module.llvm_ir.contains("declare ptr @rt_alloc_slow(i64, i64, i16)"));
+        assert!(
+            module
+                .llvm_ir
+                .contains("declare ptr @rt_alloc_slow(i64, i64, i16)")
+        );
         assert!(module.llvm_ir.contains("declare void @rt_gc_poll()"));
         assert!(
             module
