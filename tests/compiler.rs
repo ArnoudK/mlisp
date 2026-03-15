@@ -106,9 +106,24 @@ fn emits_variadic_procedure_with_rest_list_parameter() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("variadic_proc_module", &hir).unwrap();
 
-    assert!(compiled.llvm_ir.contains("define i64 @tail(i64 %0, i64 %1)"));
-    assert!(compiled.llvm_ir.contains("call ptr addrspace(1) @__mlisp_alloc_pair_gc_as1"));
-    assert!(compiled.llvm_ir.contains("call i64 @tail(i64 3, i64"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define i64 @tail(i64 %0, i64 %1)")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define i64 @__scheme_wrap_tail(ptr addrspace(1) %0, i64 %1)")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call ptr addrspace(1) @__mlisp_alloc_pair_gc_as1")
+    );
+    assert!(compiled.llvm_ir.contains(
+        "call i64 @rt_trampoline_apply(i64 ptrtoint (ptr @__scheme_wrap_tail to i64), i64 0, i64"
+    ));
 }
 
 #[test]
@@ -117,9 +132,24 @@ fn emits_variadic_lambda_with_rest_list_parameter() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("variadic_lambda_module", &hir).unwrap();
 
-    assert!(compiled.llvm_ir.contains("define i64 @__lambda_0(i64 %0, i64 %1, i64 %2)"));
-    assert!(compiled.llvm_ir.contains("call ptr addrspace(1) @__mlisp_alloc_pair_gc_as1"));
-    assert!(compiled.llvm_ir.contains("call i64 @__lambda_0(i64 3, i64 5, i64"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define i64 @__lambda_0(i64 %0, i64 %1, i64 %2)")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define i64 @__scheme_wrap___lambda_0(ptr addrspace(1) %0, i64 %1)")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call ptr addrspace(1) @__mlisp_alloc_pair_gc_as1")
+    );
+    assert!(compiled
+        .llvm_ir
+        .contains("call i64 @rt_trampoline_apply(i64 ptrtoint (ptr @__scheme_wrap___lambda_0 to i64), i64 0, i64"));
 }
 
 #[test]
@@ -129,13 +159,17 @@ fn emits_symbol_form_rest_lambda() {
     let compiled = LlvmBackend::compile_program("rest_only_lambda_module", &hir).unwrap();
 
     assert!(compiled.llvm_ir.contains("define i64 @__lambda_0(i64 %0)"));
-    assert!(compiled.llvm_ir.contains("call i64 @__lambda_0(i64"));
+    assert!(compiled
+        .llvm_ir
+        .contains("call i64 @rt_trampoline_apply(i64 ptrtoint (ptr @__scheme_wrap___lambda_0 to i64), i64 0, i64"));
 }
 
 #[test]
 fn compiles_apply_for_fixed_and_variadic_procedures() {
-    let fixed_ast = parse_program("(define (add3 a b c) (+ a (+ b c))) (apply add3 '(1 2 3))\n").unwrap();
-    let variadic_ast = parse_program("(define (tail x . rest) rest) (apply tail 1 '(2 3))\n").unwrap();
+    let fixed_ast =
+        parse_program("(define (add3 a b c) (+ a (+ b c))) (apply add3 '(1 2 3))\n").unwrap();
+    let variadic_ast =
+        parse_program("(define (tail x . rest) rest) (apply tail 1 '(2 3))\n").unwrap();
 
     let fixed_hir = lower_program(&fixed_ast).unwrap();
     let variadic_hir = lower_program(&variadic_ast).unwrap();
@@ -145,10 +179,12 @@ fn compiles_apply_for_fixed_and_variadic_procedures() {
 
     assert!(fixed_ir.llvm_ir.contains("@mlisp_list_length"));
     assert!(fixed_ir.llvm_ir.contains("@mlisp_list_ref"));
-    assert!(fixed_ir.llvm_ir.contains("call i64 @add3("));
+    assert!(fixed_ir.llvm_ir.contains("@__scheme_wrap_add3"));
+    assert!(fixed_ir.llvm_ir.contains("@rt_trampoline_apply"));
 
     assert!(variadic_ir.llvm_ir.contains("@mlisp_list_tail"));
-    assert!(variadic_ir.llvm_ir.contains("call i64 @tail("));
+    assert!(variadic_ir.llvm_ir.contains("@__scheme_wrap_tail"));
+    assert!(variadic_ir.llvm_ir.contains("@rt_trampoline_apply"));
 }
 
 #[test]
@@ -160,7 +196,8 @@ fn compiles_apply_for_closure_values() {
 
     assert!(compiled.llvm_ir.contains("@mlisp_list_length"));
     assert!(compiled.llvm_ir.contains("@mlisp_list_ref"));
-    assert!(compiled.llvm_ir.contains("call i64 @__lambda_0("));
+    assert!(compiled.llvm_ir.contains("@__scheme_wrap___lambda_0"));
+    assert!(compiled.llvm_ir.contains("@rt_trampoline_apply"));
 }
 
 #[test]
@@ -214,8 +251,13 @@ fn compiles_first_class_builtin_procedures() {
     let apply_ir = LlvmBackend::compile_program("builtin_apply_module", &apply_hir).unwrap();
 
     assert!(call_ir.llvm_ir.contains("define i64 @__builtin__"));
-    assert!(call_ir.llvm_ir.contains("call i64 @__builtin__("));
-    assert!(apply_ir.llvm_ir.contains("call i64 @__builtin__("));
+    assert!(
+        call_ir
+            .llvm_ir
+            .contains("define i64 @__scheme_wrap_builtin__(ptr addrspace(1) %0, i64 %1)")
+    );
+    assert!(call_ir.llvm_ir.contains("@rt_trampoline_apply"));
+    assert!(apply_ir.llvm_ir.contains("@rt_trampoline_apply"));
     assert!(apply_ir.llvm_ir.contains("@mlisp_list_length"));
     assert!(apply_ir.llvm_ir.contains("@mlisp_list_ref"));
 }
@@ -227,7 +269,14 @@ fn emits_procedure_definition_and_call() {
     let compiled = LlvmBackend::compile_program("proc_module", &hir).unwrap();
 
     assert!(compiled.llvm_ir.contains("define i64 @add2(i64 %0)"));
-    assert!(compiled.llvm_ir.contains("call i64 @add2(i64 81)"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define i64 @__scheme_wrap_add2(ptr addrspace(1) %0, i64 %1)")
+    );
+    assert!(compiled.llvm_ir.contains(
+        "call i64 @rt_trampoline_apply(i64 ptrtoint (ptr @__scheme_wrap_add2 to i64), i64 0, i64"
+    ));
 }
 
 #[test]
@@ -236,9 +285,17 @@ fn emits_heap_returning_procedure_with_pointer_signature() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("heap_proc_module", &hir).unwrap();
 
-    assert!(compiled.llvm_ir.contains("define ptr addrspace(1) @mkpair()"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define ptr addrspace(1) @mkpair()")
+    );
     assert!(compiled.llvm_ir.contains("call ptr addrspace(1) @mkpair()"));
-    assert!(compiled.llvm_ir.contains("call i64 @__mlisp_pair_car_gc_as1(ptr addrspace(1)"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call i64 @__mlisp_pair_car_gc_as1(ptr addrspace(1)")
+    );
 }
 
 #[test]
@@ -247,9 +304,21 @@ fn emits_heap_parameter_procedure_with_pointer_signature() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("heap_param_proc_module", &hir).unwrap();
 
-    assert!(compiled.llvm_ir.contains("define i64 @pair-head(ptr addrspace(1) %0)"));
-    assert!(compiled.llvm_ir.contains("call i64 @pair-head(ptr addrspace(1)"));
-    assert!(compiled.llvm_ir.contains("call i64 @__mlisp_pair_car_gc_as1(ptr addrspace(1) %0)"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define i64 @pair-head(ptr addrspace(1) %0)")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call i64 @pair-head(ptr addrspace(1)")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call i64 @__mlisp_pair_car_gc_as1(ptr addrspace(1) %0)")
+    );
 }
 
 #[test]
@@ -259,7 +328,14 @@ fn emits_direct_lambda_application() {
     let compiled = LlvmBackend::compile_program("lambda_module", &hir).unwrap();
 
     assert!(compiled.llvm_ir.contains("define i64 @__lambda_0(i64 %0)"));
-    assert!(compiled.llvm_ir.contains("call i64 @__lambda_0(i64 83)"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define i64 @__scheme_wrap___lambda_0(ptr addrspace(1) %0, i64 %1)")
+    );
+    assert!(compiled
+        .llvm_ir
+        .contains("call i64 @rt_trampoline_apply(i64 ptrtoint (ptr @__scheme_wrap___lambda_0 to i64), i64 0, i64"));
 }
 
 #[test]
@@ -268,9 +344,21 @@ fn emits_heap_returning_lambda_with_pointer_signature() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("heap_lambda_module", &hir).unwrap();
 
-    assert!(compiled.llvm_ir.contains("define ptr addrspace(1) @__lambda_0()"));
-    assert!(compiled.llvm_ir.contains("call ptr addrspace(1) @__lambda_0()"));
-    assert!(compiled.llvm_ir.contains("call i64 @__mlisp_vector_ref_gc_as1(ptr addrspace(1)"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define ptr addrspace(1) @__lambda_0()")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call ptr addrspace(1) @__lambda_0()")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call i64 @__mlisp_vector_ref_gc_as1(ptr addrspace(1)")
+    );
 }
 
 #[test]
@@ -279,9 +367,21 @@ fn emits_heap_parameter_lambda_with_pointer_signature() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("heap_param_lambda_module", &hir).unwrap();
 
-    assert!(compiled.llvm_ir.contains("define i64 @__lambda_0(ptr addrspace(1) %0)"));
-    assert!(compiled.llvm_ir.contains("call i64 @__lambda_0(ptr addrspace(1)"));
-    assert!(compiled.llvm_ir.contains("call i64 @__mlisp_vector_ref_gc_as1(ptr addrspace(1) %0"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define i64 @__lambda_0(ptr addrspace(1) %0)")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call i64 @__lambda_0(ptr addrspace(1)")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call i64 @__mlisp_vector_ref_gc_as1(ptr addrspace(1) %0")
+    );
 }
 
 #[test]
@@ -290,10 +390,26 @@ fn emits_captured_closure_allocation_and_indirect_call() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("captured_closure_module", &hir).unwrap();
 
-    assert!(compiled.llvm_ir.contains("define i64 @__lambda_0(ptr addrspace(1) %0)"));
-    assert!(compiled.llvm_ir.contains("call ptr addrspace(1) @__mlisp_alloc_closure_gc_as1"));
-    assert!(compiled.llvm_ir.contains("%closure.code = load i64"));
-    assert!(compiled.llvm_ir.contains("call i64 %closure.fn(ptr addrspace(1)"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define i64 @__lambda_0(ptr addrspace(1) %0)")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call ptr addrspace(1) @__mlisp_alloc_closure_gc_as1")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("%scheme.callable.code = load i64")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call i64 @rt_trampoline_apply(i64 %scheme.callable.code")
+    );
 }
 
 #[test]
@@ -303,8 +419,16 @@ fn emits_captured_heap_value_through_closure_env() {
     let compiled = LlvmBackend::compile_program("captured_pair_closure_module", &hir).unwrap();
 
     assert!(compiled.llvm_ir.contains("%closure.capture.0 = load i64"));
-    assert!(compiled.llvm_ir.contains("inttoptr i64 %closure.capture.0 to ptr addrspace(1)"));
-    assert!(compiled.llvm_ir.contains("call i64 @__mlisp_pair_car_gc_as1(ptr addrspace(1)"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("inttoptr i64 %closure.capture.0 to ptr addrspace(1)")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call i64 @__mlisp_pair_car_gc_as1(ptr addrspace(1)")
+    );
 }
 
 #[test]
@@ -334,11 +458,22 @@ fn emits_letrec_local_recursive_procedure() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("letrec_module", &hir).unwrap();
 
-    assert!(compiled
-        .llvm_ir
-        .contains("define i64 @__letrec_countdown_0(ptr addrspace(1) %0, i64 %1)"));
-    assert!(compiled.llvm_ir.contains("call ptr addrspace(1) @__mlisp_alloc_closure_gc_as1"));
-    assert!(compiled.llvm_ir.contains("%closure.code = load i64"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define i64 @__letrec_countdown_0(ptr addrspace(1) %0, i64 %1)")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call ptr addrspace(1) @__mlisp_alloc_closure_gc_as1")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("%scheme.callable.code = load i64")
+    );
+    assert!(compiled.llvm_ir.contains("@rt_trampoline_apply"));
 }
 
 #[test]
@@ -354,9 +489,22 @@ fn emits_letrec_recursive_closure_with_outer_capture() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("letrec_closure_module", &hir).unwrap();
 
-    assert!(compiled.llvm_ir.contains("call ptr addrspace(1) @__mlisp_alloc_closure_gc_as1"));
-    assert!(compiled.llvm_ir.contains("call i64 @__mlisp_closure_env_set_gc_as1"));
-    assert!(compiled.llvm_ir.contains("%closure.code = load i64"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call ptr addrspace(1) @__mlisp_alloc_closure_gc_as1")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call i64 @__mlisp_closure_env_set_gc_as1")
+    );
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("%scheme.callable.code = load i64")
+    );
+    assert!(compiled.llvm_ir.contains("@rt_trampoline_apply"));
 }
 
 #[test]
@@ -372,7 +520,13 @@ fn emits_tail_call_for_direct_self_tail_recursion() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("musttail_direct_module", &hir).unwrap();
 
-    assert!(compiled.llvm_ir.contains("tail call i64 @countdown(i64"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("define i64 @__scheme_wrap_countdown(ptr addrspace(1) %0, i64 %1)")
+    );
+    assert!(compiled.llvm_ir.contains("@rt_tail_invoke"));
+    assert!(compiled.llvm_ir.contains("@rt_tail_call_marker"));
 }
 
 #[test]
@@ -389,7 +543,13 @@ fn emits_tail_call_for_recursive_closure_tail_calls() {
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("musttail_closure_module", &hir).unwrap();
 
-    assert!(compiled.llvm_ir.contains("tail call i64 %closure.tail.fn"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("%scheme.callable.code = load i64")
+    );
+    assert!(compiled.llvm_ir.contains("@rt_tail_invoke"));
+    assert!(compiled.llvm_ir.contains("@rt_tail_call_marker"));
 }
 
 #[test]
@@ -404,7 +564,12 @@ fn compiles_letrec_star_with_sequential_recursive_scope() {
     let compiled = LlvmBackend::compile_program("letrec_star_module", &hir).unwrap();
 
     assert!(compiled.llvm_ir.contains("@__mlisp_alloc_closure_gc_as1"));
-    assert!(compiled.llvm_ir.contains("call i64 %closure.fn"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("%scheme.callable.code = load i64")
+    );
+    assert!(compiled.llvm_ir.contains("@rt_trampoline_apply"));
 }
 
 #[test]
@@ -415,7 +580,11 @@ fn allocates_pairs_on_heap_but_keeps_fixnums_immediate() {
 
     assert!(compiled.llvm_ir.contains("@__mlisp_alloc_pair_gc_as1"));
     assert!(compiled.llvm_ir.contains("call void @rt_root_slot_push"));
-    assert!(compiled.llvm_ir.contains("call i64 @__mlisp_pair_car_gc_as1"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call i64 @__mlisp_pair_car_gc_as1")
+    );
 }
 
 #[test]
@@ -520,7 +689,11 @@ fn merges_pair_values_across_if_branches() {
     let compiled = LlvmBackend::compile_program("if_pair_module", &hir).unwrap();
 
     assert!(compiled.llvm_ir.contains("phi ptr addrspace(1)"));
-    assert!(compiled.llvm_ir.contains("call i64 @__mlisp_pair_car_gc_as1(ptr addrspace(1)"));
+    assert!(
+        compiled
+            .llvm_ir
+            .contains("call i64 @__mlisp_pair_car_gc_as1(ptr addrspace(1)")
+    );
 }
 
 #[test]
@@ -529,7 +702,11 @@ fn rejects_if_branches_with_mismatched_value_kinds() {
     let hir = lower_program(&ast).unwrap();
     let error = LlvmBackend::compile_program("if_mismatch_module", &hir).unwrap_err();
 
-    assert!(error.to_string().contains("if branches must produce the same kind of value"));
+    assert!(
+        error
+            .to_string()
+            .contains("if branches must produce the same kind of value")
+    );
 }
 
 #[test]
@@ -569,8 +746,7 @@ fn compiles_eq_and_eqv_for_words_and_heap_refs() {
     let heap_ast = parse_program("(let ((p (cons 1 2))) (eqv? p p))\n").unwrap();
     let immediate_hir = lower_program(&immediate_ast).unwrap();
     let heap_hir = lower_program(&heap_ast).unwrap();
-    let immediate_ir =
-        LlvmBackend::compile_program("eq_immediate_module", &immediate_hir).unwrap();
+    let immediate_ir = LlvmBackend::compile_program("eq_immediate_module", &immediate_hir).unwrap();
     let heap_ir = LlvmBackend::compile_program("eq_heap_module", &heap_hir).unwrap();
 
     assert!(immediate_ir.llvm_ir.contains("ret i64 6"));
@@ -678,7 +854,9 @@ fn compiles_map_foreach_and_member_assoc() {
 
 #[test]
 fn compiles_pair_mutation_and_list_copy_reverse() {
-    let mutate_ast = parse_program("(let ((p (cons 1 2))) (begin (set-car! p 9) (set-cdr! p '()) p))\n").unwrap();
+    let mutate_ast =
+        parse_program("(let ((p (cons 1 2))) (begin (set-car! p 9) (set-cdr! p '()) p))\n")
+            .unwrap();
     let copy_ast = parse_program("(list-copy (list 1 2 3))\n").unwrap();
     let reverse_ast = parse_program("(reverse (list 1 2 3))\n").unwrap();
     let mutate_hir = lower_program(&mutate_ast).unwrap();
@@ -739,8 +917,9 @@ fn compiles_vector_construction_and_access() {
 
 #[test]
 fn compiles_vector_mutation_through_runtime_barrier() {
-    let ast = parse_program("(let ((v (vector 1 2))) (begin (vector-set! v 1 9) (vector-ref v 1)))\n")
-        .unwrap();
+    let ast =
+        parse_program("(let ((v (vector 1 2))) (begin (vector-set! v 1 9) (vector-ref v 1)))\n")
+            .unwrap();
     let hir = lower_program(&ast).unwrap();
     let compiled = LlvmBackend::compile_program("vector_set_module", &hir).unwrap();
 

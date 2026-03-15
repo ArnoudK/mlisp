@@ -3,8 +3,8 @@
 ## R7RS Small Gaps
 
 ### Core Semantics
-- [ ] Proper tail recursion as a real guarantee.
-  Tail positions are now lowered explicitly and matching direct/closure self-recursive calls are emitted as `tail call`, but full R7RS proper tail recursion still needs a statepoint-compatible calling-convention/trampoline rewrite.
+- [x] Proper tail recursion as a real guarantee.
+  Scheme calls now go through the uniform wrapper/trampoline ABI (`rt_trampoline_apply` for ordinary calls, `rt_tail_invoke` for tail positions), and deep self-recursive plus mutual-recursive e2e cases run without stack growth.
 - [x] `apply` for known-signature user procedures and closures.
 - [x] First-class builtin procedures so primitives can participate in `apply`, `map`, and higher-order calls.
 - [x] Variadic procedures.
@@ -69,5 +69,5 @@
 - [ ] Add more multithreaded runtime/compiler integration tests.
 
 ## Recommended Next Order
-1. [ ] Proper tail recursion
-2. [ ] Macros and libraries
+1. [ ] Continuations: `call/cc`, `dynamic-wind`
+2. [ ] Broader strings, vectors, bytevectors, and numeric coverage

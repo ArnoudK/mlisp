@@ -7,17 +7,19 @@ CHIBI_BASIC_DIR="$ROOT_DIR/chibi-scheme/tests/basic"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run-chibi-tests.sh [--list] [case ...]
+Usage: scripts/run-chibi-tests.sh [--fail-fast] [--list] [case ...]
 
 Run Chibi's basic test fixtures against mlisp and compare stdout with the
 upstream .res files.
 
 Options:
+  --fail-fast  Stop after the first failing fixture
   --list  Print all available fixture names
   -h      Show this help text
 
 Examples:
   scripts/run-chibi-tests.sh
+  scripts/run-chibi-tests.sh --fail-fast
   scripts/run-chibi-tests.sh test06-letrec test07-mutation
 EOF
 }
@@ -46,9 +48,14 @@ if [[ ! -d "$CHIBI_BASIC_DIR" ]]; then
 fi
 
 declare -a requested_cases=()
+fail_fast=false
 
 while (($# > 0)); do
   case "$1" in
+    --fail-fast)
+      fail_fast=true
+      shift
+      ;;
     --list)
       list_cases
       exit 0
@@ -144,6 +151,11 @@ for case_name in "${cases[@]}"; do
     cat "$stderr_file"
   elif [[ $status -ne 0 ]]; then
     printf 'note: mlisp exited with status %d after producing matching stdout\n' "$status"
+  fi
+
+  if [[ "$fail_fast" == true ]]; then
+    printf '\nstopped after first failure because --fail-fast was set\n'
+    exit 1
   fi
 done
 

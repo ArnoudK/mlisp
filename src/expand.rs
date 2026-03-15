@@ -148,7 +148,9 @@ impl Expander {
             && let Some((name, declarations)) = parse_define_library_form(&program.forms[0])
         {
             let library = self.load_library_from_declarations(&name, declarations)?;
-            return Ok(Program { forms: library.forms });
+            return Ok(Program {
+                forms: library.forms,
+            });
         }
 
         let mut macros = HashMap::new();
@@ -169,19 +171,17 @@ impl Expander {
         let mut expanded = Vec::new();
         for form in forms {
             if let Some((name, mut rules)) = parse_define_syntax(form, values)? {
-                self.materialize_macro_definition_values(&mut rules, values, &mut expanded, form.span);
+                self.materialize_macro_definition_values(
+                    &mut rules,
+                    values,
+                    &mut expanded,
+                    form.span,
+                );
                 macros.insert(name, rules);
                 continue;
             }
             if let Some(imports) = parse_import(form)? {
-                self.apply_imports(
-                    &imports,
-                    &mut expanded,
-                    macros,
-                    values,
-                    imported,
-                    form.span,
-                )?;
+                self.apply_imports(&imports, &mut expanded, macros, values, imported, form.span)?;
                 continue;
             }
             if parse_define_library_form(form).is_some() {
@@ -385,7 +385,9 @@ impl Expander {
                     }
                     match name.as_str() {
                         "quote" => return Ok(expr.clone()),
-                        "lambda" => return self.expand_lambda(expr, items, tail.as_deref(), macros),
+                        "lambda" => {
+                            return self.expand_lambda(expr, items, tail.as_deref(), macros);
+                        }
                         "define" => return self.expand_define(expr, items, macros),
                         "define-syntax" | "syntax-rules" | "import" | "define-library" => {
                             return Ok(expr.clone());
@@ -495,7 +497,10 @@ impl Expander {
             return Ok(expr.clone());
         }
         let bindings = match &items[1].kind {
-            ExprKind::List { items: bindings, tail: None } => bindings
+            ExprKind::List {
+                items: bindings,
+                tail: None,
+            } => bindings
                 .iter()
                 .map(|binding| match &binding.kind {
                     ExprKind::List { items, tail: None } if items.len() == 2 => Ok(Expr {
@@ -604,7 +609,7 @@ impl Expander {
                                 env,
                                 repeated_index,
                                 scope,
-                            )
+                            );
                         }
                         "let" | "let*" | "letrec" | "letrec*" => {
                             return self.expand_template_let_like(
@@ -615,7 +620,7 @@ impl Expander {
                                 env,
                                 repeated_index,
                                 scope,
-                            )
+                            );
                         }
                         "set!" => {
                             return self.expand_template_set(
@@ -625,7 +630,7 @@ impl Expander {
                                 env,
                                 repeated_index,
                                 scope,
-                            )
+                            );
                         }
                         "define" => {
                             return self.expand_template_define(
@@ -635,7 +640,7 @@ impl Expander {
                                 env,
                                 repeated_index,
                                 scope,
-                            )
+                            );
                         }
                         _ => {}
                     }
@@ -796,7 +801,9 @@ impl Expander {
                 items_out.extend(
                     items[2..]
                         .iter()
-                        .map(|item| self.expand_template(item, rules, env, repeated_index, &body_scope))
+                        .map(|item| {
+                            self.expand_template(item, rules, env, repeated_index, &body_scope)
+                        })
                         .collect::<Result<Vec<_>, _>>()?,
                 );
                 Ok(Expr {
@@ -847,7 +854,11 @@ impl Expander {
         if items.len() < 3 {
             return Ok(template.clone());
         }
-        let ExprKind::List { items: bindings, tail: None } = &items[1].kind else {
+        let ExprKind::List {
+            items: bindings,
+            tail: None,
+        } = &items[1].kind
+        else {
             return Ok(template.clone());
         };
 
@@ -870,11 +881,19 @@ impl Expander {
                 "letrec" | "letrec*" => &body_scope,
                 _ => scope,
             };
-            let (binder, binder_name) =
-                self.expand_template_binder(&binding_items[0], rules, env, repeated_index, &body_scope)?;
+            let (binder, binder_name) = self.expand_template_binder(
+                &binding_items[0],
+                rules,
+                env,
+                repeated_index,
+                &body_scope,
+            )?;
             let init =
                 self.expand_template(&binding_items[1], rules, env, repeated_index, init_scope)?;
-            body_scope.insert(symbol_name(&binding_items[0], "template binding name")?, binder_name);
+            body_scope.insert(
+                symbol_name(&binding_items[0], "template binding name")?,
+                binder_name,
+            );
             expanded_bindings.push(Expr {
                 kind: ExprKind::List {
                     items: vec![binder, init],
@@ -1046,7 +1065,7 @@ fn parse_export(form: &Expr) -> Result<Option<Vec<ExportSpec>>, CompileError> {
             _ => {
                 return Err(CompileError::Expand(
                     "export entries must be identifiers or (rename internal external)".into(),
-                ))
+                ));
             }
         }
     }
@@ -1111,7 +1130,8 @@ fn parse_import_set(expr: &Expr) -> Result<ImportSet, CompileError> {
             "rename" => {
                 if items.len() < 3 {
                     return Err(CompileError::Expand(
-                        "rename import set requires a base set and at least one rename clause".into(),
+                        "rename import set requires a base set and at least one rename clause"
+                            .into(),
                     ));
                 }
                 let set = Box::new(parse_import_set(&items[1])?);
@@ -1272,17 +1292,22 @@ fn rename_expr(
             kind: ExprKind::Symbol(rename_symbol(symbol, rename_map, bound)),
             span: expr.span,
         }),
-        ExprKind::Quote(_) | ExprKind::Integer(_) | ExprKind::Boolean(_) | ExprKind::Char(_)
+        ExprKind::Quote(_)
+        | ExprKind::Integer(_)
+        | ExprKind::Boolean(_)
+        | ExprKind::Char(_)
         | ExprKind::String(_) => Ok(expr.clone()),
         ExprKind::List { items, tail } => {
             if let Some(head) = items.first()
                 && let Some(keyword) = symbol_value(head)
             {
                 match keyword {
-                    "lambda" => return rename_lambda_form(expr, items, tail.as_deref(), rename_map, bound),
+                    "lambda" => {
+                        return rename_lambda_form(expr, items, tail.as_deref(), rename_map, bound);
+                    }
                     "define" => return rename_define_form(expr, items, rename_map, bound),
                     "let" | "let*" | "letrec" | "letrec*" => {
-                        return rename_let_like(expr, keyword, items, rename_map, bound)
+                        return rename_let_like(expr, keyword, items, rename_map, bound);
                     }
                     "set!" => return rename_set_form(expr, items, rename_map, bound),
                     "quote" | "import" | "export" | "define-library" => return Ok(expr.clone()),
@@ -1366,7 +1391,10 @@ fn rename_define_form(
             },
             span: expr.span,
         }),
-        ExprKind::List { items: signature, tail } if !signature.is_empty() => {
+        ExprKind::List {
+            items: signature,
+            tail,
+        } if !signature.is_empty() => {
             let mut body_bound = bound.clone();
             bind_signature_formals(signature, tail.as_deref(), &mut body_bound)?;
             let mut renamed_signature = vec![Expr {
@@ -1582,7 +1610,10 @@ fn parse_library_name_expr(expr: &Expr) -> Result<Vec<String>, CompileError> {
 }
 
 fn parse_identifier_list(items: &[Expr], context: &str) -> Result<Vec<String>, CompileError> {
-    items.iter().map(|item| symbol_name(item, context)).collect()
+    items
+        .iter()
+        .map(|item| symbol_name(item, context))
+        .collect()
 }
 
 fn parse_rename_pair(expr: &Expr) -> Result<(String, String), CompileError> {
@@ -1605,7 +1636,9 @@ fn parse_rename_pair(expr: &Expr) -> Result<(String, String), CompileError> {
 fn symbol_name(expr: &Expr, context: &str) -> Result<String, CompileError> {
     match &expr.kind {
         ExprKind::Symbol(symbol) => Ok(symbol.clone()),
-        _ => Err(CompileError::Expand(format!("{context} must be an identifier"))),
+        _ => Err(CompileError::Expand(format!(
+            "{context} must be an identifier"
+        ))),
     }
 }
 
@@ -1660,14 +1693,20 @@ fn filter_exports<T: Clone>(
     Ok(filtered)
 }
 
-fn exclude_exports<T>(mut exports: HashMap<String, T>, names: &[String]) -> Result<HashMap<String, T>, CompileError> {
+fn exclude_exports<T>(
+    mut exports: HashMap<String, T>,
+    names: &[String],
+) -> Result<HashMap<String, T>, CompileError> {
     for name in names {
         exports.remove(name);
     }
     Ok(exports)
 }
 
-fn prefix_exports<T>(exports: HashMap<String, T>, prefix: &str) -> Result<HashMap<String, T>, CompileError> {
+fn prefix_exports<T>(
+    exports: HashMap<String, T>,
+    prefix: &str,
+) -> Result<HashMap<String, T>, CompileError> {
     let mut prefixed = HashMap::new();
     for (name, value) in exports {
         let aliased = format!("{prefix}{name}");
@@ -1699,7 +1738,10 @@ fn rename_exports<T: Clone>(
     }
     for (name, value) in exports {
         if let Some((target, replacement)) = replacements.get(&name) {
-            if renamed.insert(target.clone(), replacement.clone()).is_some() {
+            if renamed
+                .insert(target.clone(), replacement.clone())
+                .is_some()
+            {
                 return Err(CompileError::Expand(format!(
                     "duplicate binding for '{}' after rename import",
                     target
@@ -1959,11 +2001,10 @@ fn match_list_tail(
 }
 
 fn rebuild_list_expr(items: &[Expr], tail: Option<&Expr>) -> Expr {
-    let span = items
-        .iter()
-        .fold(tail.map(|expr| expr.span).unwrap_or_default(), |span, expr| {
-            span.merge(expr.span)
-        });
+    let span = items.iter().fold(
+        tail.map(|expr| expr.span).unwrap_or_default(),
+        |span, expr| span.merge(expr.span),
+    );
     Expr {
         kind: ExprKind::List {
             items: items.to_vec(),
@@ -2034,13 +2075,10 @@ mod tests {
 
     #[test]
     fn expands_local_syntax_rules_macro() {
-        let program = parse_program(
-            "(define-syntax inc (syntax-rules () ((inc x) (+ x 1)))) (inc 4)\n",
-        )
-        .unwrap();
-        let expanded =
-            expand_program(Path::new("./tests/e2e/macro_test.scm"), &program)
+        let program =
+            parse_program("(define-syntax inc (syntax-rules () ((inc x) (+ x 1)))) (inc 4)\n")
                 .unwrap();
+        let expanded = expand_program(Path::new("./tests/e2e/macro_test.scm"), &program).unwrap();
         assert_eq!(expanded.forms.len(), 1);
         assert!(format!("{:?}", expanded.forms[0].kind).contains("List"));
     }
@@ -2079,12 +2117,20 @@ mod tests {
         assert!(matches!(&items[0].kind, ExprKind::Symbol(name) if name == "list"));
         assert_eq!(items.len(), 3);
         for (expected_lhs, expected_rhs, item) in [(1, 2, &items[1]), (3, 4, &items[2])] {
-            let ExprKind::List { items: sum_items, tail: None } = &item.kind else {
+            let ExprKind::List {
+                items: sum_items,
+                tail: None,
+            } = &item.kind
+            else {
                 panic!("expected pair-sums element to be a proper list");
             };
             assert!(matches!(&sum_items[0].kind, ExprKind::Symbol(name) if name == "+"));
-            assert!(matches!(&sum_items[1].kind, ExprKind::Integer(value) if *value == expected_lhs));
-            assert!(matches!(&sum_items[2].kind, ExprKind::Integer(value) if *value == expected_rhs));
+            assert!(
+                matches!(&sum_items[1].kind, ExprKind::Integer(value) if *value == expected_lhs)
+            );
+            assert!(
+                matches!(&sum_items[2].kind, ExprKind::Integer(value) if *value == expected_rhs)
+            );
         }
     }
 
@@ -2132,6 +2178,8 @@ mod tests {
         };
         assert!(matches!(&items[0].kind, ExprKind::Symbol(name) if name == "let"));
         let body = items.last().expect("expected let body");
-        assert!(matches!(&body.kind, ExprKind::Symbol(name) if name.starts_with("__macro_ref_helper_")));
+        assert!(
+            matches!(&body.kind, ExprKind::Symbol(name) if name.starts_with("__macro_ref_helper_"))
+        );
     }
 }

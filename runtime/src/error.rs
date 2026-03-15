@@ -13,6 +13,7 @@ pub enum RuntimeError {
     AllocationFailed,
     FixnumOutOfRange,
     WorkerThreadPanicked,
+    InvalidTrampolineState,
 }
 
 impl fmt::Display for RuntimeError {
@@ -29,6 +30,7 @@ impl fmt::Display for RuntimeError {
             Self::AllocationFailed => f.write_str("allocation failed"),
             Self::FixnumOutOfRange => f.write_str("fixnum does not fit in tagged representation"),
             Self::WorkerThreadPanicked => f.write_str("worker thread panicked"),
+            Self::InvalidTrampolineState => f.write_str("invalid trampoline state"),
         }
     }
 }

@@ -146,18 +146,25 @@ pub fn run_path(input: &Path) -> Result<RunOutput, CompileError> {
     fs::create_dir_all(&root).map_err(|error| CompileError::io(Some(root.clone()), error))?;
     let ir_path = root.join(format!("{}.ll", rewritten.module_name));
     let exe_path = root.join(&rewritten.module_name);
-    fs::write(&ir_path, &rewritten.llvm_ir).map_err(|error| CompileError::io(Some(ir_path.clone()), error))?;
+    fs::write(&ir_path, &rewritten.llvm_ir)
+        .map_err(|error| CompileError::io(Some(ir_path.clone()), error))?;
 
     let runtime_staticlib = ensure_runtime_staticlib()?;
     let native_static_libs = rust_runtime_native_libs()?;
 
     let mut clang = Command::new("clang");
     clang.env("TMPDIR", build_tmp_dir()?);
-    clang.arg(&ir_path).arg(&runtime_staticlib).arg("-o").arg(&exe_path);
+    clang
+        .arg(&ir_path)
+        .arg(&runtime_staticlib)
+        .arg("-o")
+        .arg(&exe_path);
     for lib in &native_static_libs {
         clang.arg(lib);
     }
-    let link = clang.output().map_err(|error| CompileError::io(None::<PathBuf>, error))?;
+    let link = clang
+        .output()
+        .map_err(|error| CompileError::io(None::<PathBuf>, error))?;
     if !link.status.success() {
         return Err(CompileError::Codegen(format!(
             "clang link failed: {}",
@@ -359,7 +366,8 @@ fn ensure_runtime_staticlib() -> Result<PathBuf, CompileError> {
     }
 
     let deps_dir = PathBuf::from("target/debug/deps");
-    let entries = fs::read_dir(&deps_dir).map_err(|error| CompileError::io(Some(deps_dir.clone()), error))?;
+    let entries =
+        fs::read_dir(&deps_dir).map_err(|error| CompileError::io(Some(deps_dir.clone()), error))?;
     let mut candidates = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -378,7 +386,15 @@ fn ensure_runtime_staticlib() -> Result<PathBuf, CompileError> {
 
 fn rust_runtime_native_libs() -> Result<Vec<String>, CompileError> {
     let output = Command::new("cargo")
-        .args(["rustc", "--offline", "-p", "mlisp-runtime", "--lib", "--", "--print=native-static-libs"])
+        .args([
+            "rustc",
+            "--offline",
+            "-p",
+            "mlisp-runtime",
+            "--lib",
+            "--",
+            "--print=native-static-libs",
+        ])
         .output()
         .map_err(|error| CompileError::io(None::<PathBuf>, error))?;
     if !output.status.success() {

@@ -1,6 +1,6 @@
 use crate::backend::statepoint::heap_address_space;
-use inkwell::module::Module;
 use inkwell::AddressSpace;
+use inkwell::module::Module;
 use inkwell::values::FunctionValue;
 
 pub struct RuntimeAbi<'ctx> {
@@ -12,6 +12,10 @@ pub struct RuntimeAbi<'ctx> {
     pub rt_exception_pending: FunctionValue<'ctx>,
     pub rt_raise: FunctionValue<'ctx>,
     pub rt_take_pending_exception: FunctionValue<'ctx>,
+    pub rt_tail_call_marker: FunctionValue<'ctx>,
+    pub rt_tail_pending: FunctionValue<'ctx>,
+    pub rt_tail_invoke: FunctionValue<'ctx>,
+    pub rt_trampoline_apply: FunctionValue<'ctx>,
     pub rt_object_write_post: FunctionValue<'ctx>,
     pub rt_root_slot_push: FunctionValue<'ctx>,
     pub rt_root_slot_pop: FunctionValue<'ctx>,
@@ -106,13 +110,13 @@ impl<'ctx> RuntimeAbi<'ctx> {
         let pair_fn = word.fn_type(&[word.into(), word.into()], false);
         let raw_bytes_string_fn = word.fn_type(&[raw_ptr.into(), word.into()], false);
         let raw_words_vector_fn = word.fn_type(&[raw_ptr.into(), word.into()], false);
-        let raw_words_closure_fn = raw_ptr.fn_type(&[word.into(), raw_ptr.into(), word.into()], false);
+        let raw_words_closure_fn =
+            raw_ptr.fn_type(&[word.into(), raw_ptr.into(), word.into()], false);
         let raw_pair_alloc_fn = raw_ptr.fn_type(&[word.into(), word.into()], false);
         let raw_pair_access_fn = word.fn_type(&[raw_ptr.into()], false);
         let raw_ptr_index_access_fn = word.fn_type(&[raw_ptr.into(), word.into()], false);
 
-        let alloc_pair_gc_raw =
-            module.add_function("mlisp_alloc_pair_gc", raw_pair_alloc_fn, None);
+        let alloc_pair_gc_raw = module.add_function("mlisp_alloc_pair_gc", raw_pair_alloc_fn, None);
         let pair_car_gc_raw = module.add_function("mlisp_pair_car_gc", raw_pair_access_fn, None);
         let pair_cdr_gc_raw = module.add_function("mlisp_pair_cdr_gc", raw_pair_access_fn, None);
         let pair_set_car_gc_raw = module.add_function(
@@ -135,10 +139,16 @@ impl<'ctx> RuntimeAbi<'ctx> {
             raw_ptr.fn_type(&[raw_ptr.into(), word.into()], false),
             None,
         );
-        let alloc_box_gc_raw =
-            module.add_function("mlisp_alloc_box_gc", raw_ptr.fn_type(&[word.into()], false), None);
-        let alloc_promise_gc_raw =
-            module.add_function("mlisp_alloc_promise_gc", raw_ptr.fn_type(&[word.into()], false), None);
+        let alloc_box_gc_raw = module.add_function(
+            "mlisp_alloc_box_gc",
+            raw_ptr.fn_type(&[word.into()], false),
+            None,
+        );
+        let alloc_promise_gc_raw = module.add_function(
+            "mlisp_alloc_promise_gc",
+            raw_ptr.fn_type(&[word.into()], false),
+            None,
+        );
         let box_set_gc_raw = module.add_function(
             "mlisp_box_set_gc",
             word.fn_type(&[raw_ptr.into(), word.into()], false),
@@ -161,8 +171,11 @@ impl<'ctx> RuntimeAbi<'ctx> {
         );
         let alloc_closure_gc_raw =
             module.add_function("mlisp_alloc_closure_gc", raw_words_closure_fn, None);
-        let closure_code_ptr_gc_raw =
-            module.add_function("mlisp_closure_code_ptr_gc", word.fn_type(&[raw_ptr.into()], false), None);
+        let closure_code_ptr_gc_raw = module.add_function(
+            "mlisp_closure_code_ptr_gc",
+            word.fn_type(&[raw_ptr.into()], false),
+            None,
+        );
         let closure_env_ref_gc_raw =
             module.add_function("mlisp_closure_env_ref_gc", raw_ptr_index_access_fn, None);
         let closure_env_set_gc_raw = module.add_function(
@@ -201,7 +214,8 @@ impl<'ctx> RuntimeAbi<'ctx> {
             None,
         );
 
-        let alloc_pair_gc = add_gc_alloc_wrapper(module, "__mlisp_alloc_pair_gc_as1", alloc_pair_gc_raw);
+        let alloc_pair_gc =
+            add_gc_alloc_wrapper(module, "__mlisp_alloc_pair_gc_as1", alloc_pair_gc_raw);
         let pair_car_gc = add_gc_unary_wrapper(module, "__mlisp_pair_car_gc_as1", pair_car_gc_raw);
         let pair_cdr_gc = add_gc_unary_wrapper(module, "__mlisp_pair_cdr_gc_as1", pair_cdr_gc_raw);
         let pair_set_car_gc =
@@ -212,32 +226,57 @@ impl<'ctx> RuntimeAbi<'ctx> {
             add_gc_buffer_alloc_wrapper(module, "__mlisp_alloc_string_gc_as1", alloc_string_gc_raw);
         let alloc_symbol_gc =
             add_gc_buffer_alloc_wrapper(module, "__mlisp_alloc_symbol_gc_as1", alloc_symbol_gc_raw);
-        let alloc_box_gc = add_gc_unary_alloc_wrapper(module, "__mlisp_alloc_box_gc_as1", alloc_box_gc_raw);
-        let alloc_promise_gc =
-            add_gc_unary_alloc_wrapper(module, "__mlisp_alloc_promise_gc_as1", alloc_promise_gc_raw);
-        let box_set_gc = add_gc_unary_value_wrapper(module, "__mlisp_box_set_gc_as1", box_set_gc_raw);
-        let promise_forced_gc =
-            add_gc_unary_bool_wrapper(module, "__mlisp_promise_forced_gc_as1", promise_forced_gc_raw);
+        let alloc_box_gc =
+            add_gc_unary_alloc_wrapper(module, "__mlisp_alloc_box_gc_as1", alloc_box_gc_raw);
+        let alloc_promise_gc = add_gc_unary_alloc_wrapper(
+            module,
+            "__mlisp_alloc_promise_gc_as1",
+            alloc_promise_gc_raw,
+        );
+        let box_set_gc =
+            add_gc_unary_value_wrapper(module, "__mlisp_box_set_gc_as1", box_set_gc_raw);
+        let promise_forced_gc = add_gc_unary_bool_wrapper(
+            module,
+            "__mlisp_promise_forced_gc_as1",
+            promise_forced_gc_raw,
+        );
         let promise_value_gc =
             add_gc_unary_wrapper(module, "__mlisp_promise_value_gc_as1", promise_value_gc_raw);
-        let promise_resolve_gc =
-            add_gc_unary_value_wrapper(module, "__mlisp_promise_resolve_gc_as1", promise_resolve_gc_raw);
-        let alloc_closure_gc =
-            add_gc_code_buffer_alloc_wrapper(module, "__mlisp_alloc_closure_gc_as1", alloc_closure_gc_raw);
-        let closure_code_ptr_gc =
-            add_gc_unary_wrapper(module, "__mlisp_closure_code_ptr_gc_as1", closure_code_ptr_gc_raw);
-        let closure_env_ref_gc =
-            add_gc_index_wrapper(module, "__mlisp_closure_env_ref_gc_as1", closure_env_ref_gc_raw);
-        let closure_env_set_gc =
-            add_gc_index_value_wrapper(module, "__mlisp_closure_env_set_gc_as1", closure_env_set_gc_raw);
+        let promise_resolve_gc = add_gc_unary_value_wrapper(
+            module,
+            "__mlisp_promise_resolve_gc_as1",
+            promise_resolve_gc_raw,
+        );
+        let alloc_closure_gc = add_gc_code_buffer_alloc_wrapper(
+            module,
+            "__mlisp_alloc_closure_gc_as1",
+            alloc_closure_gc_raw,
+        );
+        let closure_code_ptr_gc = add_gc_unary_wrapper(
+            module,
+            "__mlisp_closure_code_ptr_gc_as1",
+            closure_code_ptr_gc_raw,
+        );
+        let closure_env_ref_gc = add_gc_index_wrapper(
+            module,
+            "__mlisp_closure_env_ref_gc_as1",
+            closure_env_ref_gc_raw,
+        );
+        let closure_env_set_gc = add_gc_index_value_wrapper(
+            module,
+            "__mlisp_closure_env_set_gc_as1",
+            closure_env_set_gc_raw,
+        );
         let string_length_gc =
             add_gc_unary_wrapper(module, "__mlisp_string_length_gc_as1", string_length_gc_raw);
-        let string_ref_gc = add_gc_index_wrapper(module, "__mlisp_string_ref_gc_as1", string_ref_gc_raw);
+        let string_ref_gc =
+            add_gc_index_wrapper(module, "__mlisp_string_ref_gc_as1", string_ref_gc_raw);
         let alloc_vector_gc =
             add_gc_buffer_alloc_wrapper(module, "__mlisp_alloc_vector_gc_as1", alloc_vector_gc_raw);
         let vector_length_gc =
             add_gc_unary_wrapper(module, "__mlisp_vector_length_gc_as1", vector_length_gc_raw);
-        let vector_ref_gc = add_gc_index_wrapper(module, "__mlisp_vector_ref_gc_as1", vector_ref_gc_raw);
+        let vector_ref_gc =
+            add_gc_index_wrapper(module, "__mlisp_vector_ref_gc_as1", vector_ref_gc_raw);
         let vector_set_gc =
             add_gc_index_value_wrapper(module, "__mlisp_vector_set_gc_as1", vector_set_gc_raw);
         add_poll_wrapper(module);
@@ -248,7 +287,11 @@ impl<'ctx> RuntimeAbi<'ctx> {
                 bool_ty.fn_type(&[word.into(), word.into()], false),
                 None,
             ),
-            rt_bind_thread: module.add_function("rt_bind_thread", raw_ptr.fn_type(&[], false), None),
+            rt_bind_thread: module.add_function(
+                "rt_bind_thread",
+                raw_ptr.fn_type(&[], false),
+                None,
+            ),
             rt_unbind_thread: module.add_function(
                 "rt_unbind_thread",
                 context.void_type().fn_type(&[raw_ptr.into()], false),
@@ -259,7 +302,11 @@ impl<'ctx> RuntimeAbi<'ctx> {
                 raw_ptr.fn_type(&[word.into(), word.into(), i16_ty.into()], false),
                 None,
             ),
-            rt_gc_poll: module.add_function("rt_gc_poll", context.void_type().fn_type(&[], false), None),
+            rt_gc_poll: module.add_function(
+                "rt_gc_poll",
+                context.void_type().fn_type(&[], false),
+                None,
+            ),
             rt_exception_pending: module.add_function(
                 "rt_exception_pending",
                 bool_ty.fn_type(&[], false),
@@ -269,6 +316,26 @@ impl<'ctx> RuntimeAbi<'ctx> {
             rt_take_pending_exception: module.add_function(
                 "rt_take_pending_exception",
                 word.fn_type(&[], false),
+                None,
+            ),
+            rt_tail_call_marker: module.add_function(
+                "rt_tail_call_marker",
+                word.fn_type(&[], false),
+                None,
+            ),
+            rt_tail_pending: module.add_function(
+                "rt_tail_pending",
+                bool_ty.fn_type(&[], false),
+                None,
+            ),
+            rt_tail_invoke: module.add_function(
+                "rt_tail_invoke",
+                word.fn_type(&[word.into(), word.into(), word.into()], false),
+                None,
+            ),
+            rt_trampoline_apply: module.add_function(
+                "rt_trampoline_apply",
+                word.fn_type(&[word.into(), word.into(), word.into()], false),
                 None,
             ),
             rt_object_write_post: module.add_function(
@@ -464,7 +531,11 @@ fn add_gc_alloc_wrapper<'ctx>(
     let builder = context.create_builder();
     let gc_ptr = context.ptr_type(heap_address_space());
     let word = context.i64_type();
-    let wrapper = module.add_function(name, gc_ptr.fn_type(&[word.into(), word.into()], false), None);
+    let wrapper = module.add_function(
+        name,
+        gc_ptr.fn_type(&[word.into(), word.into()], false),
+        None,
+    );
     let entry = context.append_basic_block(wrapper, "entry");
     builder.position_at_end(entry);
     let arg0 = wrapper.get_nth_param(0).unwrap().into_int_value();
@@ -476,9 +547,7 @@ fn add_gc_alloc_wrapper<'ctx>(
         .basic()
         .unwrap()
         .into_pointer_value();
-    let cast = builder
-        .build_address_space_cast(raw, gc_ptr, "gc")
-        .unwrap();
+    let cast = builder.build_address_space_cast(raw, gc_ptr, "gc").unwrap();
     builder.build_return(Some(&cast)).unwrap();
     wrapper
 }
@@ -493,7 +562,11 @@ fn add_gc_buffer_alloc_wrapper<'ctx>(
     let raw_ptr = context.ptr_type(AddressSpace::default());
     let gc_ptr = context.ptr_type(heap_address_space());
     let word = context.i64_type();
-    let wrapper = module.add_function(name, gc_ptr.fn_type(&[raw_ptr.into(), word.into()], false), None);
+    let wrapper = module.add_function(
+        name,
+        gc_ptr.fn_type(&[raw_ptr.into(), word.into()], false),
+        None,
+    );
     let entry = context.append_basic_block(wrapper, "entry");
     builder.position_at_end(entry);
     let arg0 = wrapper.get_nth_param(0).unwrap().into_pointer_value();
@@ -505,9 +578,7 @@ fn add_gc_buffer_alloc_wrapper<'ctx>(
         .basic()
         .unwrap()
         .into_pointer_value();
-    let cast = builder
-        .build_address_space_cast(raw, gc_ptr, "gc")
-        .unwrap();
+    let cast = builder.build_address_space_cast(raw, gc_ptr, "gc").unwrap();
     builder.build_return(Some(&cast)).unwrap();
     wrapper
 }
@@ -564,9 +635,7 @@ fn add_gc_code_buffer_alloc_wrapper<'ctx>(
         .basic()
         .unwrap()
         .into_pointer_value();
-    let cast = builder
-        .build_address_space_cast(raw, gc_ptr, "gc")
-        .unwrap();
+    let cast = builder.build_address_space_cast(raw, gc_ptr, "gc").unwrap();
     builder.build_return(Some(&cast)).unwrap();
     wrapper
 }
@@ -637,7 +706,11 @@ fn add_gc_index_wrapper<'ctx>(
     let gc_ptr = context.ptr_type(heap_address_space());
     let raw_ptr = context.ptr_type(AddressSpace::default());
     let word = context.i64_type();
-    let wrapper = module.add_function(name, word.fn_type(&[gc_ptr.into(), word.into()], false), None);
+    let wrapper = module.add_function(
+        name,
+        word.fn_type(&[gc_ptr.into(), word.into()], false),
+        None,
+    );
     let entry = context.append_basic_block(wrapper, "entry");
     builder.position_at_end(entry);
     let arg0 = wrapper.get_nth_param(0).unwrap().into_pointer_value();
@@ -680,7 +753,11 @@ fn add_gc_index_value_wrapper<'ctx>(
         .build_address_space_cast(arg0, raw_ptr, "raw")
         .unwrap();
     let result = builder
-        .build_call(raw_target, &[raw_arg.into(), arg1.into(), arg2.into()], "result")
+        .build_call(
+            raw_target,
+            &[raw_arg.into(), arg1.into(), arg2.into()],
+            "result",
+        )
         .unwrap()
         .try_as_basic_value()
         .basic()
@@ -700,12 +777,18 @@ fn add_gc_unary_value_wrapper<'ctx>(
     let gc_ptr = context.ptr_type(heap_address_space());
     let raw_ptr = context.ptr_type(AddressSpace::default());
     let word = context.i64_type();
-    let wrapper = module.add_function(name, word.fn_type(&[gc_ptr.into(), word.into()], false), None);
+    let wrapper = module.add_function(
+        name,
+        word.fn_type(&[gc_ptr.into(), word.into()], false),
+        None,
+    );
     let entry = context.append_basic_block(wrapper, "entry");
     builder.position_at_end(entry);
     let arg0 = wrapper.get_nth_param(0).unwrap().into_pointer_value();
     let arg1 = wrapper.get_nth_param(1).unwrap().into_int_value();
-    let raw_arg = builder.build_address_space_cast(arg0, raw_ptr, "raw").unwrap();
+    let raw_arg = builder
+        .build_address_space_cast(arg0, raw_ptr, "raw")
+        .unwrap();
     let result = builder
         .build_call(raw_target, &[raw_arg.into(), arg1.into()], "result")
         .unwrap()
@@ -730,7 +813,10 @@ mod tests {
 
         assert_eq!(abi.rt_mmtk_init.get_name().to_str(), Ok("rt_mmtk_init"));
         assert_eq!(abi.rt_bind_thread.get_name().to_str(), Ok("rt_bind_thread"));
-        assert_eq!(abi.rt_unbind_thread.get_name().to_str(), Ok("rt_unbind_thread"));
+        assert_eq!(
+            abi.rt_unbind_thread.get_name().to_str(),
+            Ok("rt_unbind_thread")
+        );
         assert_eq!(abi.rt_alloc_slow.get_name().to_str(), Ok("rt_alloc_slow"));
         assert_eq!(abi.rt_gc_poll.get_name().to_str(), Ok("rt_gc_poll"));
         assert_eq!(
@@ -743,11 +829,30 @@ mod tests {
             Ok("rt_take_pending_exception")
         );
         assert_eq!(
+            abi.rt_tail_call_marker.get_name().to_str(),
+            Ok("rt_tail_call_marker")
+        );
+        assert_eq!(
+            abi.rt_tail_pending.get_name().to_str(),
+            Ok("rt_tail_pending")
+        );
+        assert_eq!(abi.rt_tail_invoke.get_name().to_str(), Ok("rt_tail_invoke"));
+        assert_eq!(
+            abi.rt_trampoline_apply.get_name().to_str(),
+            Ok("rt_trampoline_apply")
+        );
+        assert_eq!(
             abi.rt_object_write_post.get_name().to_str(),
             Ok("rt_object_write_post")
         );
-        assert_eq!(abi.rt_root_slot_push.get_name().to_str(), Ok("rt_root_slot_push"));
-        assert_eq!(abi.rt_root_slot_pop.get_name().to_str(), Ok("rt_root_slot_pop"));
+        assert_eq!(
+            abi.rt_root_slot_push.get_name().to_str(),
+            Ok("rt_root_slot_push")
+        );
+        assert_eq!(
+            abi.rt_root_slot_pop.get_name().to_str(),
+            Ok("rt_root_slot_pop")
+        );
         assert_eq!(
             abi.gc_safepoint_poll.get_name().to_str(),
             Ok("gc_safepoint_poll")
@@ -758,15 +863,36 @@ mod tests {
         assert_eq!(abi.write.get_name().to_str(), Ok("mlisp_write"));
         assert_eq!(abi.newline.get_name().to_str(), Ok("mlisp_newline"));
         assert_eq!(abi.alloc_pair.get_name().to_str(), Ok("mlisp_alloc_pair"));
-        assert_eq!(abi.alloc_pair_gc.get_name().to_str(), Ok("__mlisp_alloc_pair_gc_as1"));
+        assert_eq!(
+            abi.alloc_pair_gc.get_name().to_str(),
+            Ok("__mlisp_alloc_pair_gc_as1")
+        );
         assert_eq!(abi.pair_car.get_name().to_str(), Ok("mlisp_pair_car"));
         assert_eq!(abi.pair_cdr.get_name().to_str(), Ok("mlisp_pair_cdr"));
-        assert_eq!(abi.pair_car_gc.get_name().to_str(), Ok("__mlisp_pair_car_gc_as1"));
-        assert_eq!(abi.pair_cdr_gc.get_name().to_str(), Ok("__mlisp_pair_cdr_gc_as1"));
-        assert_eq!(abi.pair_set_car.get_name().to_str(), Ok("mlisp_pair_set_car"));
-        assert_eq!(abi.pair_set_cdr.get_name().to_str(), Ok("mlisp_pair_set_cdr"));
-        assert_eq!(abi.pair_set_car_gc.get_name().to_str(), Ok("__mlisp_pair_set_car_gc_as1"));
-        assert_eq!(abi.pair_set_cdr_gc.get_name().to_str(), Ok("__mlisp_pair_set_cdr_gc_as1"));
+        assert_eq!(
+            abi.pair_car_gc.get_name().to_str(),
+            Ok("__mlisp_pair_car_gc_as1")
+        );
+        assert_eq!(
+            abi.pair_cdr_gc.get_name().to_str(),
+            Ok("__mlisp_pair_cdr_gc_as1")
+        );
+        assert_eq!(
+            abi.pair_set_car.get_name().to_str(),
+            Ok("mlisp_pair_set_car")
+        );
+        assert_eq!(
+            abi.pair_set_cdr.get_name().to_str(),
+            Ok("mlisp_pair_set_cdr")
+        );
+        assert_eq!(
+            abi.pair_set_car_gc.get_name().to_str(),
+            Ok("__mlisp_pair_set_car_gc_as1")
+        );
+        assert_eq!(
+            abi.pair_set_cdr_gc.get_name().to_str(),
+            Ok("__mlisp_pair_set_cdr_gc_as1")
+        );
         assert_eq!(abi.is_pair.get_name().to_str(), Ok("mlisp_is_pair"));
         assert_eq!(abi.is_list.get_name().to_str(), Ok("mlisp_is_list"));
         assert_eq!(abi.list_length.get_name().to_str(), Ok("mlisp_list_length"));
@@ -781,13 +907,22 @@ mod tests {
         assert_eq!(abi.assoc.get_name().to_str(), Ok("mlisp_assoc"));
         assert_eq!(abi.list_copy.get_name().to_str(), Ok("mlisp_list_copy"));
         assert_eq!(abi.reverse.get_name().to_str(), Ok("mlisp_reverse"));
-        assert_eq!(abi.alloc_box_gc.get_name().to_str(), Ok("__mlisp_alloc_box_gc_as1"));
-        assert_eq!(abi.box_set_gc.get_name().to_str(), Ok("__mlisp_box_set_gc_as1"));
+        assert_eq!(
+            abi.alloc_box_gc.get_name().to_str(),
+            Ok("__mlisp_alloc_box_gc_as1")
+        );
+        assert_eq!(
+            abi.box_set_gc.get_name().to_str(),
+            Ok("__mlisp_box_set_gc_as1")
+        );
         assert_eq!(
             abi.alloc_closure.get_name().to_str(),
             Ok("mlisp_alloc_closure")
         );
-        assert_eq!(abi.alloc_closure_gc.get_name().to_str(), Ok("__mlisp_alloc_closure_gc_as1"));
+        assert_eq!(
+            abi.alloc_closure_gc.get_name().to_str(),
+            Ok("__mlisp_alloc_closure_gc_as1")
+        );
         assert_eq!(
             abi.closure_code_ptr_gc.get_name().to_str(),
             Ok("__mlisp_closure_code_ptr_gc_as1")
@@ -800,27 +935,72 @@ mod tests {
             abi.closure_env_set_gc.get_name().to_str(),
             Ok("__mlisp_closure_env_set_gc_as1")
         );
-        assert_eq!(abi.alloc_string.get_name().to_str(), Ok("mlisp_alloc_string"));
-        assert_eq!(abi.alloc_string_gc.get_name().to_str(), Ok("__mlisp_alloc_string_gc_as1"));
-        assert_eq!(abi.alloc_symbol.get_name().to_str(), Ok("mlisp_alloc_symbol"));
-        assert_eq!(abi.alloc_symbol_gc.get_name().to_str(), Ok("__mlisp_alloc_symbol_gc_as1"));
+        assert_eq!(
+            abi.alloc_string.get_name().to_str(),
+            Ok("mlisp_alloc_string")
+        );
+        assert_eq!(
+            abi.alloc_string_gc.get_name().to_str(),
+            Ok("__mlisp_alloc_string_gc_as1")
+        );
+        assert_eq!(
+            abi.alloc_symbol.get_name().to_str(),
+            Ok("mlisp_alloc_symbol")
+        );
+        assert_eq!(
+            abi.alloc_symbol_gc.get_name().to_str(),
+            Ok("__mlisp_alloc_symbol_gc_as1")
+        );
         assert_eq!(abi.is_symbol.get_name().to_str(), Ok("mlisp_is_symbol"));
-        assert_eq!(abi.alloc_values.get_name().to_str(), Ok("mlisp_alloc_values"));
+        assert_eq!(
+            abi.alloc_values.get_name().to_str(),
+            Ok("mlisp_alloc_values")
+        );
         assert_eq!(abi.is_values.get_name().to_str(), Ok("mlisp_is_values"));
-        assert_eq!(abi.values_length.get_name().to_str(), Ok("mlisp_values_length"));
+        assert_eq!(
+            abi.values_length.get_name().to_str(),
+            Ok("mlisp_values_length")
+        );
         assert_eq!(abi.values_ref.get_name().to_str(), Ok("mlisp_values_ref"));
-        assert_eq!(abi.values_tail_list.get_name().to_str(), Ok("mlisp_values_tail_list"));
+        assert_eq!(
+            abi.values_tail_list.get_name().to_str(),
+            Ok("mlisp_values_tail_list")
+        );
         assert_eq!(abi.equal.get_name().to_str(), Ok("mlisp_equal"));
-        assert_eq!(abi.apply_builtin.get_name().to_str(), Ok("mlisp_apply_builtin"));
-        assert_eq!(abi.symbol_to_string.get_name().to_str(), Ok("mlisp_symbol_to_string"));
-        assert_eq!(abi.string_to_symbol.get_name().to_str(), Ok("mlisp_string_to_symbol"));
+        assert_eq!(
+            abi.apply_builtin.get_name().to_str(),
+            Ok("mlisp_apply_builtin")
+        );
+        assert_eq!(
+            abi.symbol_to_string.get_name().to_str(),
+            Ok("mlisp_symbol_to_string")
+        );
+        assert_eq!(
+            abi.string_to_symbol.get_name().to_str(),
+            Ok("mlisp_string_to_symbol")
+        );
         assert_eq!(abi.is_string.get_name().to_str(), Ok("mlisp_is_string"));
-        assert_eq!(abi.string_length.get_name().to_str(), Ok("mlisp_string_length"));
+        assert_eq!(
+            abi.string_length.get_name().to_str(),
+            Ok("mlisp_string_length")
+        );
         assert_eq!(abi.string_ref.get_name().to_str(), Ok("mlisp_string_ref"));
-        assert_eq!(abi.string_length_gc.get_name().to_str(), Ok("__mlisp_string_length_gc_as1"));
-        assert_eq!(abi.string_ref_gc.get_name().to_str(), Ok("__mlisp_string_ref_gc_as1"));
-        assert_eq!(abi.alloc_vector.get_name().to_str(), Ok("mlisp_alloc_vector"));
-        assert_eq!(abi.alloc_vector_gc.get_name().to_str(), Ok("__mlisp_alloc_vector_gc_as1"));
+        assert_eq!(
+            abi.string_length_gc.get_name().to_str(),
+            Ok("__mlisp_string_length_gc_as1")
+        );
+        assert_eq!(
+            abi.string_ref_gc.get_name().to_str(),
+            Ok("__mlisp_string_ref_gc_as1")
+        );
+        assert_eq!(
+            abi.alloc_vector.get_name().to_str(),
+            Ok("mlisp_alloc_vector")
+        );
+        assert_eq!(
+            abi.alloc_vector_gc.get_name().to_str(),
+            Ok("__mlisp_alloc_vector_gc_as1")
+        );
         assert_eq!(abi.is_vector.get_name().to_str(), Ok("mlisp_is_vector"));
         assert_eq!(
             abi.vector_length.get_name().to_str(),
@@ -828,8 +1008,17 @@ mod tests {
         );
         assert_eq!(abi.vector_ref.get_name().to_str(), Ok("mlisp_vector_ref"));
         assert_eq!(abi.vector_set.get_name().to_str(), Ok("mlisp_vector_set"));
-        assert_eq!(abi.vector_length_gc.get_name().to_str(), Ok("__mlisp_vector_length_gc_as1"));
-        assert_eq!(abi.vector_ref_gc.get_name().to_str(), Ok("__mlisp_vector_ref_gc_as1"));
-        assert_eq!(abi.vector_set_gc.get_name().to_str(), Ok("__mlisp_vector_set_gc_as1"));
+        assert_eq!(
+            abi.vector_length_gc.get_name().to_str(),
+            Ok("__mlisp_vector_length_gc_as1")
+        );
+        assert_eq!(
+            abi.vector_ref_gc.get_name().to_str(),
+            Ok("__mlisp_vector_ref_gc_as1")
+        );
+        assert_eq!(
+            abi.vector_set_gc.get_name().to_str(),
+            Ok("__mlisp_vector_set_gc_as1")
+        );
     }
 }

@@ -17,67 +17,95 @@ struct Lowerer {
 
 impl Lowerer {
     fn lower_top_level(&mut self, form: &AstExpr) -> Result<TopLevel, CompileError> {
-        if let AstExprKind::List { items, tail: None } = &form.kind {
-            if let Some(AstExpr {
-                kind: AstExprKind::Symbol(symbol),
-                ..
-            }) = items.first()
-                && symbol == "define"
-            {
-                if items.len() < 3 {
-                    return Err(CompileError::Lower(
-                        "define expects a binding target and at least one body form".into(),
-                    ));
+        if let Some(definition) = self.try_lower_definition(form)? {
+            match definition {
+                LoweredDefinition::Variable { name, value } => {
+                    return Ok(TopLevel::Definition { name, value });
                 }
-
-                match &items[1].kind {
-                    AstExprKind::Symbol(name) => {
-                        if items.len() != 3 {
-                            return Err(CompileError::Lower(
-                                "variable define expects exactly one value expression".into(),
-                            ));
-                        }
-
-                        let value = self.lower_expr(&items[2])?;
-                        return Ok(TopLevel::Definition {
-                            name: name.clone(),
-                            value,
-                        });
-                    }
-                    AstExprKind::List { items: signature, tail } => {
-                        let Some(name_expr) = signature.first() else {
-                            return Err(CompileError::Lower(
-                                "procedure define requires a non-empty signature".into(),
-                            ));
-                        };
-
-                        let name = match &name_expr.kind {
-                            AstExprKind::Symbol(name) => name.clone(),
-                            _ => {
-                                return Err(CompileError::Lower(
-                                    "procedure name must be a symbol".into(),
-                                ));
-                            }
-                        };
-
-                        let formals = self.lower_formals(&signature[1..], tail.as_deref())?;
-                        let body = self.lower_body(&items[2..])?;
-                        return Ok(TopLevel::Procedure(Procedure {
-                            name,
-                            formals,
-                            body,
-                        }));
-                    }
-                    _ => {
-                        return Err(CompileError::Lower(
-                            "define target must be a symbol or parameter list".into(),
-                        ));
-                    }
+                LoweredDefinition::Procedure {
+                    name,
+                    formals,
+                    body,
+                } => {
+                    return Ok(TopLevel::Procedure(Procedure {
+                        name,
+                        formals,
+                        body,
+                    }));
                 }
             }
         }
 
         Ok(TopLevel::Expression(self.lower_expr(form)?))
+    }
+
+    fn try_lower_definition(
+        &mut self,
+        form: &AstExpr,
+    ) -> Result<Option<LoweredDefinition>, CompileError> {
+        let AstExprKind::List { items, tail: None } = &form.kind else {
+            return Ok(None);
+        };
+        let Some(AstExpr {
+            kind: AstExprKind::Symbol(symbol),
+            ..
+        }) = items.first()
+        else {
+            return Ok(None);
+        };
+        if symbol != "define" {
+            return Ok(None);
+        }
+        if items.len() < 3 {
+            return Err(CompileError::Lower(
+                "define expects a binding target and at least one body form".into(),
+            ));
+        }
+
+        match &items[1].kind {
+            AstExprKind::Symbol(name) => {
+                if items.len() != 3 {
+                    return Err(CompileError::Lower(
+                        "variable define expects exactly one value expression".into(),
+                    ));
+                }
+
+                Ok(Some(LoweredDefinition::Variable {
+                    name: name.clone(),
+                    value: self.lower_expr(&items[2])?,
+                }))
+            }
+            AstExprKind::List {
+                items: signature,
+                tail,
+            } => {
+                let Some(name_expr) = signature.first() else {
+                    return Err(CompileError::Lower(
+                        "procedure define requires a non-empty signature".into(),
+                    ));
+                };
+
+                let name = match &name_expr.kind {
+                    AstExprKind::Symbol(name) => name.clone(),
+                    _ => {
+                        return Err(CompileError::Lower(
+                            "procedure name must be a symbol".into(),
+                        ));
+                    }
+                };
+
+                let formals = self.lower_formals(&signature[1..], tail.as_deref())?;
+                let body = self.lower_body(&items[2..])?;
+                Ok(Some(LoweredDefinition::Procedure {
+                    name,
+                    formals,
+                    body,
+                }))
+            }
+            _ => Err(CompileError::Lower(
+                "define target must be a symbol or parameter list".into(),
+            )),
+        }
     }
 
     fn lower_expr(&mut self, expr: &AstExpr) -> Result<Expr, CompileError> {
@@ -94,7 +122,11 @@ impl Lowerer {
         Ok(Expr { kind })
     }
 
-    fn lower_list(&mut self, items: &[AstExpr], tail: Option<&AstExpr>) -> Result<ExprKind, CompileError> {
+    fn lower_list(
+        &mut self,
+        items: &[AstExpr],
+        tail: Option<&AstExpr>,
+    ) -> Result<ExprKind, CompileError> {
         if tail.is_some() {
             return Err(CompileError::Lower(
                 "dotted lists are only valid in data and formal parameter positions".into(),
@@ -134,9 +166,7 @@ impl Lowerer {
                     let name = match &items[1].kind {
                         AstExprKind::Symbol(symbol) => symbol.clone(),
                         _ => {
-                            return Err(CompileError::Lower(
-                                "set! target must be a symbol".into(),
-                            ));
+                            return Err(CompileError::Lower("set! target must be a symbol".into()));
                         }
                     };
                     return Ok(ExprKind::Set {
@@ -288,7 +318,11 @@ impl Lowerer {
         let body = self.lower_body(&items[1..])?;
         Ok(ExprKind::If {
             condition: Box::new(test),
-            then_branch: Box::new(if when_true { body.clone() } else { unspecified_expr() }),
+            then_branch: Box::new(if when_true {
+                body.clone()
+            } else {
+                unspecified_expr()
+            }),
             else_branch: Box::new(if when_true { unspecified_expr() } else { body }),
         })
     }
@@ -324,7 +358,10 @@ impl Lowerer {
         }
 
         let bindings = match &items[0].kind {
-            AstExprKind::List { items: bindings, tail: None } => bindings
+            AstExprKind::List {
+                items: bindings,
+                tail: None,
+            } => bindings
                 .iter()
                 .map(|binding| self.lower_do_binding(binding))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -353,7 +390,10 @@ impl Lowerer {
 
         let loop_name = self.gensym("do_loop");
         let formals = Formals {
-            required: bindings.iter().map(|binding| binding.name.clone()).collect(),
+            required: bindings
+                .iter()
+                .map(|binding| binding.name.clone())
+                .collect(),
             rest: None,
         };
         let done_expr = if result_exprs.is_empty() {
@@ -419,7 +459,10 @@ impl Lowerer {
         }
 
         let bindings = match &items[0].kind {
-            AstExprKind::List { items: bindings, tail: None } => bindings
+            AstExprKind::List {
+                items: bindings,
+                tail: None,
+            } => bindings
                 .iter()
                 .map(|binding| self.lower_binding(binding))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -643,7 +686,10 @@ impl Lowerer {
         }
 
         let datums = match &items[0].kind {
-            AstExprKind::List { items: datums, tail: None } => datums
+            AstExprKind::List {
+                items: datums,
+                tail: None,
+            } => datums
                 .iter()
                 .map(|datum| self.lower_datum(datum))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -707,6 +753,42 @@ impl Lowerer {
     }
 
     fn lower_body(&mut self, items: &[AstExpr]) -> Result<Expr, CompileError> {
+        let definition_count = items
+            .iter()
+            .take_while(|item| matches!(self.try_lower_definition(item), Ok(Some(_))))
+            .count();
+        if definition_count > 0 {
+            let mut bindings = Vec::with_capacity(definition_count);
+            for item in &items[..definition_count] {
+                match self.try_lower_definition(item)? {
+                    Some(LoweredDefinition::Variable { name, value }) => {
+                        bindings.push(Binding { name, value });
+                    }
+                    Some(LoweredDefinition::Procedure {
+                        name,
+                        formals,
+                        body,
+                    }) => bindings.push(Binding {
+                        name,
+                        value: Expr {
+                            kind: ExprKind::Lambda {
+                                formals,
+                                body: Box::new(body),
+                            },
+                        },
+                    }),
+                    None => unreachable!(),
+                }
+            }
+            let body = self.lower_body(&items[definition_count..])?;
+            return Ok(Expr {
+                kind: ExprKind::LetStar {
+                    bindings,
+                    body: Box::new(body),
+                },
+            });
+        }
+
         match items {
             [] => Err(CompileError::Lower(
                 "expected at least one expression in body".into(),
@@ -758,7 +840,10 @@ impl Lowerer {
         }
 
         let bindings = match &items[0].kind {
-            AstExprKind::List { items: bindings, tail: None } => bindings
+            AstExprKind::List {
+                items: bindings,
+                tail: None,
+            } => bindings
                 .iter()
                 .map(|binding| self.lower_binding(binding))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -803,9 +888,7 @@ impl Lowerer {
 
     fn lower_do_binding(&mut self, expr: &AstExpr) -> Result<DoBinding, CompileError> {
         let AstExprKind::List { items, tail: None } = &expr.kind else {
-            return Err(CompileError::Lower(
-                "do binding must be a list".into(),
-            ));
+            return Err(CompileError::Lower("do binding must be a list".into()));
         };
         if !(2..=3).contains(&items.len()) {
             return Err(CompileError::Lower(
@@ -877,6 +960,18 @@ impl Lowerer {
             body: Box::new(nested_body),
         })
     }
+}
+
+enum LoweredDefinition {
+    Variable {
+        name: String,
+        value: Expr,
+    },
+    Procedure {
+        name: String,
+        formals: Formals,
+        body: Expr,
+    },
 }
 
 #[derive(Clone, Copy)]

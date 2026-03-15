@@ -5,7 +5,7 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
-use inkwell::values::{BasicMetadataValueEnum, FunctionValue, IntValue, LLVMTailCallKind, PointerValue};
+use inkwell::values::{BasicMetadataValueEnum, FunctionValue, IntValue, PointerValue};
 
 use crate::backend::runtime::RuntimeAbi;
 use crate::backend::statepoint::{attach_gc_strategy, gc_ptr_type};
@@ -40,6 +40,7 @@ enum AbiValueKind {
 #[derive(Clone, Copy)]
 struct FunctionInfo<'ctx> {
     value: FunctionValue<'ctx>,
+    wrapper: FunctionValue<'ctx>,
     signature: FunctionSignature,
 }
 
@@ -97,12 +98,6 @@ enum RootedCallable<'ctx> {
         slot: PointerValue<'ctx>,
         signature: FunctionSignature,
     },
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CallableKind {
-    Direct,
-    Closure,
 }
 
 pub struct LlvmBackend;
@@ -164,7 +159,9 @@ impl<'ctx> Compiler<'ctx> {
         let entry = self.context.append_basic_block(main, "entry");
         let exception_block = self.context.append_basic_block(main, "exception.return");
         builder.position_at_end(entry);
-        self.exception_targets.push(ExceptionTarget { block: exception_block });
+        self.exception_targets.push(ExceptionTarget {
+            block: exception_block,
+        });
 
         let mut env = HashMap::new();
         let mut last_value = CodegenValue::Word(self.const_fixnum(0));
@@ -180,14 +177,21 @@ impl<'ctx> Compiler<'ctx> {
                         rooted_top_level_count += 1;
                         self.root_word(
                             &builder,
-                            self.value_to_word(&builder, compiled, &format!("top.level.{name}.word"))?,
+                            self.value_to_word(
+                                &builder,
+                                compiled,
+                                &format!("top.level.{name}.word"),
+                            )?,
                             &format!("top.level.{name}.root"),
                         )?
                     } else {
                         compiled
                     };
                     env.insert(name.clone(), stored);
-                    last_value = CodegenValue::Word(self.word_type().const_int(Value::unspecified().bits() as u64, false));
+                    last_value = CodegenValue::Word(
+                        self.word_type()
+                            .const_int(Value::unspecified().bits() as u64, false),
+                    );
                 }
                 TopLevel::Expression(expr) => {
                     last_value = self.compile_expr(&builder, main, &env, expr)?;
@@ -202,7 +206,11 @@ impl<'ctx> Compiler<'ctx> {
         builder
             .build_return(Some(&return_value))
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
-        self.emit_exception_return_block(exception_block, AbiValueKind::Word, rooted_top_level_count)?;
+        self.emit_exception_return_block(
+            exception_block,
+            AbiValueKind::Word,
+            rooted_top_level_count,
+        )?;
 
         if main.verify(true) {
             Ok(CompiledModule {
@@ -236,16 +244,20 @@ impl<'ctx> Compiler<'ctx> {
                     .get(&procedure.name)
                     .copied()
                     .unwrap_or_else(|| self.default_signature(&procedure.formals));
-                let function = self.module.add_function(
-                    &procedure.name,
-                    self.function_type(signature),
-                    None,
-                );
+                let wrapper_name = format!("__scheme_wrap_{}", sanitize_name(&procedure.name));
+                let function =
+                    self.module
+                        .add_function(&procedure.name, self.function_type(signature), None);
+                let wrapper =
+                    self.module
+                        .add_function(&wrapper_name, self.scheme_wrapper_type(), None);
                 attach_gc_strategy(function);
+                attach_gc_strategy(wrapper);
                 self.functions.insert(
                     procedure.name.clone(),
                     FunctionInfo {
                         value: function,
+                        wrapper,
                         signature,
                     },
                 );
@@ -266,6 +278,7 @@ impl<'ctx> Compiler<'ctx> {
                     &procedure.body,
                     &HashMap::new(),
                 )?;
+                self.compile_direct_scheme_wrapper(function, &procedure.formals)?;
             }
         }
         Ok(())
@@ -275,12 +288,20 @@ impl<'ctx> Compiler<'ctx> {
         for name in builtin_procedure_names() {
             let signature = builtin_wrapper_signature(name);
             let function_name = format!("__builtin_{}", sanitize_name(name));
-            let function = self.module.add_function(&function_name, self.function_type(signature), None);
+            let wrapper_name = format!("__scheme_wrap_builtin_{}", sanitize_name(name));
+            let function =
+                self.module
+                    .add_function(&function_name, self.function_type(signature), None);
+            let wrapper = self
+                .module
+                .add_function(&wrapper_name, self.scheme_wrapper_type(), None);
             attach_gc_strategy(function);
+            attach_gc_strategy(wrapper);
             self.builtin_functions.insert(
                 (*name).to_string(),
                 FunctionInfo {
                     value: function,
+                    wrapper,
                     signature,
                 },
             );
@@ -294,6 +315,7 @@ impl<'ctx> Compiler<'ctx> {
                 CompileError::Codegen(format!("missing builtin wrapper for '{name}'"))
             })?;
             self.compile_builtin_wrapper(function, name)?;
+            self.compile_builtin_scheme_wrapper(function, name)?;
         }
         Ok(())
     }
@@ -313,7 +335,9 @@ impl<'ctx> Compiler<'ctx> {
             .context
             .append_basic_block(function.value, "exception.return");
         builder.position_at_end(entry);
-        self.exception_targets.push(ExceptionTarget { block: exception_block });
+        self.exception_targets.push(ExceptionTarget {
+            block: exception_block,
+        });
 
         let mut env = HashMap::new();
         let mut prefix_args = Vec::with_capacity(
@@ -326,7 +350,10 @@ impl<'ctx> Compiler<'ctx> {
                     "missing builtin wrapper parameter {index} for '{builtin_name}'"
                 ))
             })?;
-            env.insert(param_name.clone(), CodegenValue::Word(param.into_int_value()));
+            env.insert(
+                param_name.clone(),
+                CodegenValue::Word(param.into_int_value()),
+            );
             prefix_args.push(Expr {
                 kind: ExprKind::Variable(param_name),
             });
@@ -339,18 +366,29 @@ impl<'ctx> Compiler<'ctx> {
                     "missing builtin wrapper rest parameter for '{builtin_name}'"
                 ))
             })?;
-            env.insert(rest_name.clone(), CodegenValue::Word(param.into_int_value()));
+            env.insert(
+                rest_name.clone(),
+                CodegenValue::Word(param.into_int_value()),
+            );
             param.into_int_value()
         } else {
             self.word_type().const_int(EMPTY_LIST as u64, false)
         };
-        let argument_list =
-            self.build_prefixed_list_value(&builder, function.value, &env, &prefix_args, tail_list, "builtin.args")?;
+        let argument_list = self.build_prefixed_list_value(
+            &builder,
+            function.value,
+            &env,
+            &prefix_args,
+            tail_list,
+            "builtin.args",
+        )?;
         let result = builder
             .build_call(
                 self.runtime.apply_builtin,
                 &[
-                    self.word_type().const_int(builtin_procedure_id(builtin_name) as u64, false).into(),
+                    self.word_type()
+                        .const_int(builtin_procedure_id(builtin_name) as u64, false)
+                        .into(),
                     argument_list.into(),
                 ],
                 "builtin.apply",
@@ -379,6 +417,187 @@ impl<'ctx> Compiler<'ctx> {
         }
     }
 
+    fn compile_builtin_scheme_wrapper(
+        &mut self,
+        function: FunctionInfo<'ctx>,
+        builtin_name: &str,
+    ) -> Result<(), CompileError> {
+        if function.wrapper.get_first_basic_block().is_some() {
+            return Ok(());
+        }
+
+        let builder = self.context.create_builder();
+        let entry = self.context.append_basic_block(function.wrapper, "entry");
+        builder.position_at_end(entry);
+        let args_list = function
+            .wrapper
+            .get_nth_param(1)
+            .ok_or_else(|| {
+                CompileError::Codegen(format!(
+                    "missing Scheme wrapper args parameter for builtin '{builtin_name}'"
+                ))
+            })?
+            .into_int_value();
+        let result = builder
+            .build_call(
+                self.runtime.apply_builtin,
+                &[
+                    self.word_type()
+                        .const_int(builtin_procedure_id(builtin_name) as u64, false)
+                        .into(),
+                    args_list.into(),
+                ],
+                "builtin.scheme.apply",
+            )
+            .map_err(|error| CompileError::Codegen(error.to_string()))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| {
+                CompileError::Codegen("builtin Scheme wrapper did not return a value".into())
+            })?
+            .into_int_value();
+        builder
+            .build_return(Some(&result))
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        if function.wrapper.verify(true) {
+            Ok(())
+        } else {
+            Err(CompileError::Codegen(format!(
+                "llvm verification failed for builtin Scheme wrapper '{}'",
+                builtin_name
+            )))
+        }
+    }
+
+    fn compile_direct_scheme_wrapper(
+        &mut self,
+        function: FunctionInfo<'ctx>,
+        formals: &Formals,
+    ) -> Result<(), CompileError> {
+        if function.wrapper.get_first_basic_block().is_some() {
+            return Ok(());
+        }
+
+        let builder = self.context.create_builder();
+        let entry = self.context.append_basic_block(function.wrapper, "entry");
+        builder.position_at_end(entry);
+        let args_list = function
+            .wrapper
+            .get_nth_param(1)
+            .ok_or_else(|| {
+                CompileError::Codegen(format!(
+                    "missing Scheme wrapper args parameter for function '{}'",
+                    function.value.get_name().to_str().unwrap_or("<lambda>")
+                ))
+            })?
+            .into_int_value();
+
+        if !function.signature.rest {
+            self.assert_list_length(
+                &builder,
+                function.wrapper,
+                args_list,
+                function.signature.required_param_kinds.len(),
+            )?;
+        } else {
+            self.assert_list_length_at_least(
+                &builder,
+                function.wrapper,
+                args_list,
+                function.signature.required_param_kinds.len(),
+            )?;
+        }
+
+        let mut args = Vec::with_capacity(
+            function.signature.required_param_kinds.len() + usize::from(function.signature.rest),
+        );
+        for (index, kind) in function.signature.required_param_kinds.iter().enumerate() {
+            let loaded =
+                self.load_list_element(&builder, args_list, index, *kind, "scheme.wrapper.arg")?;
+            args.push(self.convert_argument_value(
+                &builder,
+                loaded,
+                *kind,
+                "scheme.wrapper.arg",
+            )?);
+        }
+        if formals.rest.is_some() {
+            let rest = self.list_tail_word(
+                &builder,
+                args_list,
+                function.signature.required_param_kinds.len(),
+                "scheme.wrapper.rest",
+            )?;
+            args.push(rest.into());
+        }
+
+        let result = builder
+            .build_call(function.value, &args, "scheme.wrapper.call")
+            .map_err(|error| CompileError::Codegen(error.to_string()))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CompileError::Codegen("Scheme wrapper did not return a value".into()))?;
+        let tail_pending = builder
+            .build_call(
+                self.runtime.rt_tail_pending,
+                &[],
+                "scheme.wrapper.tail_pending",
+            )
+            .map_err(|error| CompileError::Codegen(error.to_string()))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CompileError::Codegen("tail pending did not return a value".into()))?
+            .into_int_value();
+        let tail_block = self
+            .context
+            .append_basic_block(function.wrapper, "tail.pending");
+        let value_block = self
+            .context
+            .append_basic_block(function.wrapper, "tail.value");
+        builder
+            .build_conditional_branch(tail_pending, tail_block, value_block)
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+
+        builder.position_at_end(tail_block);
+        let marker = builder
+            .build_call(
+                self.runtime.rt_tail_call_marker,
+                &[],
+                "scheme.wrapper.tail_marker",
+            )
+            .map_err(|error| CompileError::Codegen(error.to_string()))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CompileError::Codegen("tail marker did not return a value".into()))?
+            .into_int_value();
+        builder
+            .build_return(Some(&marker))
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+
+        builder.position_at_end(value_block);
+        let wrapped = match function.signature.return_kind {
+            AbiValueKind::Word => result.into_int_value(),
+            AbiValueKind::Heap(_) => builder
+                .build_ptr_to_int(
+                    result.into_pointer_value(),
+                    self.word_type(),
+                    "scheme.wrapper.word",
+                )
+                .map_err(|error| CompileError::Codegen(error.to_string()))?,
+        };
+        builder
+            .build_return(Some(&wrapped))
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        if function.wrapper.verify(true) {
+            Ok(())
+        } else {
+            Err(CompileError::Codegen(format!(
+                "llvm verification failed for Scheme wrapper '{}'",
+                function.wrapper.get_name().to_str().unwrap_or("<wrapper>")
+            )))
+        }
+    }
+
     fn compile_function_body(
         &mut self,
         function: FunctionInfo<'ctx>,
@@ -396,7 +615,9 @@ impl<'ctx> Compiler<'ctx> {
             .context
             .append_basic_block(function.value, "exception.return");
         builder.position_at_end(entry);
-        self.exception_targets.push(ExceptionTarget { block: exception_block });
+        self.exception_targets.push(ExceptionTarget {
+            block: exception_block,
+        });
 
         let mut env = outer_env.clone();
         let formal_names = formals.all_names();
@@ -404,15 +625,12 @@ impl<'ctx> Compiler<'ctx> {
         let pair_mutated_names = self.collect_pair_mutated_names_with_initial(body, formal_names);
         let mut rooted_param_count = 0usize;
         for (index, param_name) in formals.required.iter().enumerate() {
-            let param = function
-                .value
-                .get_nth_param(index as u32)
-                .ok_or_else(|| {
-                    CompileError::Codegen(format!(
-                        "missing parameter {index} for function '{}'",
-                        function.value.get_name().to_str().unwrap_or("<lambda>")
-                    ))
-                })?;
+            let param = function.value.get_nth_param(index as u32).ok_or_else(|| {
+                CompileError::Codegen(format!(
+                    "missing parameter {index} for function '{}'",
+                    function.value.get_name().to_str().unwrap_or("<lambda>")
+                ))
+            })?;
             let value = match function
                 .signature
                 .required_param_kinds
@@ -467,13 +685,16 @@ impl<'ctx> Compiler<'ctx> {
         self.compile_tail_expr(
             &builder,
             function.value,
-            CallableKind::Direct,
             function.signature,
             &env,
             body,
             rooted_param_count,
         )?;
-        self.emit_exception_return_block(exception_block, function.signature.return_kind, rooted_param_count)?;
+        self.emit_exception_return_block(
+            exception_block,
+            function.signature.return_kind,
+            rooted_param_count,
+        )?;
         self.exception_targets.pop();
 
         if function.value.verify(true) {
@@ -495,12 +716,14 @@ impl<'ctx> Compiler<'ctx> {
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         match &expr.kind {
             ExprKind::Unspecified => Ok(CodegenValue::Word(
-                self.word_type().const_int(Value::unspecified().bits() as u64, false),
+                self.word_type()
+                    .const_int(Value::unspecified().bits() as u64, false),
             )),
             ExprKind::Integer(value) => Ok(CodegenValue::Word(self.const_fixnum_checked(*value)?)),
             ExprKind::Boolean(value) => Ok(CodegenValue::Word(self.const_bool(*value))),
             ExprKind::Char(value) => Ok(CodegenValue::Word(
-                self.word_type().const_int(Value::encode_char(*value).bits() as u64, false),
+                self.word_type()
+                    .const_int(Value::encode_char(*value).bits() as u64, false),
             )),
             ExprKind::String(value) => self.compile_string_literal(builder, value),
             ExprKind::Variable(name) => match env.get(name).copied() {
@@ -524,7 +747,9 @@ impl<'ctx> Compiler<'ctx> {
                     })
                     .ok_or_else(|| CompileError::Codegen(format!("undefined variable '{name}'"))),
             },
-            ExprKind::Set { name, value } => self.compile_set(builder, current_function, env, name, value),
+            ExprKind::Set { name, value } => {
+                self.compile_set(builder, current_function, env, name, value)
+            }
             ExprKind::Begin(exprs) => {
                 let mut last = CodegenValue::Word(self.const_fixnum(0));
                 for expr in exprs {
@@ -540,21 +765,29 @@ impl<'ctx> Compiler<'ctx> {
                 Ok(result)
             }
             ExprKind::LetStar { bindings, body } => {
-                let (scoped, rooted_count) =
-                    self.compile_sequential_bindings(builder, current_function, env, bindings, body)?;
+                let (scoped, rooted_count) = self.compile_sequential_bindings(
+                    builder,
+                    current_function,
+                    env,
+                    bindings,
+                    body,
+                )?;
                 let result = self.compile_expr(builder, current_function, &scoped, body)?;
                 self.pop_root_slots(builder, rooted_count)?;
                 Ok(result)
             }
             ExprKind::LetRec { bindings, body } => {
-                let scoped = self.compile_recursive_bindings(builder, current_function, env, bindings)?;
+                let scoped =
+                    self.compile_recursive_bindings(builder, current_function, env, bindings)?;
                 let mut merged = env.clone();
                 merged.extend(scoped);
                 self.compile_expr(builder, current_function, &merged, body)
             }
-            ExprKind::Guard { name, handler, body } => {
-                self.compile_guard(builder, current_function, env, name, handler, body)
-            }
+            ExprKind::Guard {
+                name,
+                handler,
+                body,
+            } => self.compile_guard(builder, current_function, env, name, handler, body),
             ExprKind::Delay(expr) => self.compile_delay(builder, env, expr),
             ExprKind::Force(expr) => self.compile_force(builder, current_function, env, expr),
             ExprKind::If {
@@ -623,9 +856,7 @@ impl<'ctx> Compiler<'ctx> {
                 let result = self.compile_call(builder, current_function, env, callee, args)?;
                 self.branch_on_pending_exception(builder, current_function, result)
             }
-            ExprKind::Lambda { formals, body } => {
-                self.compile_lambda(builder, env, formals, body)
-            }
+            ExprKind::Lambda { formals, body } => self.compile_lambda(builder, env, formals, body),
             ExprKind::Quote(datum) => self.compile_quote(builder, datum),
         }
     }
@@ -634,7 +865,6 @@ impl<'ctx> Compiler<'ctx> {
         &mut self,
         builder: &Builder<'ctx>,
         current_function: FunctionValue<'ctx>,
-        callable_kind: CallableKind,
         current_signature: FunctionSignature,
         env: &HashMap<String, CodegenValue<'ctx>>,
         expr: &Expr,
@@ -659,7 +889,6 @@ impl<'ctx> Compiler<'ctx> {
                 self.compile_tail_expr(
                     builder,
                     current_function,
-                    callable_kind,
                     current_signature,
                     env,
                     &exprs[exprs.len() - 1],
@@ -672,7 +901,6 @@ impl<'ctx> Compiler<'ctx> {
                 self.compile_tail_expr(
                     builder,
                     current_function,
-                    callable_kind,
                     current_signature,
                     &scoped,
                     body,
@@ -680,12 +908,16 @@ impl<'ctx> Compiler<'ctx> {
                 )
             }
             ExprKind::LetStar { bindings, body } => {
-                let (scoped, rooted_count) =
-                    self.compile_sequential_bindings(builder, current_function, env, bindings, body)?;
+                let (scoped, rooted_count) = self.compile_sequential_bindings(
+                    builder,
+                    current_function,
+                    env,
+                    bindings,
+                    body,
+                )?;
                 self.compile_tail_expr(
                     builder,
                     current_function,
-                    callable_kind,
                     current_signature,
                     &scoped,
                     body,
@@ -726,7 +958,6 @@ impl<'ctx> Compiler<'ctx> {
                 self.compile_tail_expr(
                     builder,
                     current_function,
-                    callable_kind,
                     current_signature,
                     env,
                     then_branch,
@@ -737,26 +968,34 @@ impl<'ctx> Compiler<'ctx> {
                 self.compile_tail_expr(
                     builder,
                     current_function,
-                    callable_kind,
                     current_signature,
                     env,
                     else_branch,
                     cleanup_roots,
                 )
             }
-            ExprKind::Guard { name, handler, body } => {
-                let body_block = self.context.append_basic_block(current_function, "guard.body");
-                let handler_block = self.context.append_basic_block(current_function, "guard.handler");
+            ExprKind::Guard {
+                name,
+                handler,
+                body,
+            } => {
+                let body_block = self
+                    .context
+                    .append_basic_block(current_function, "guard.body");
+                let handler_block = self
+                    .context
+                    .append_basic_block(current_function, "guard.handler");
                 builder
                     .build_unconditional_branch(body_block)
                     .map_err(|error| CompileError::Codegen(error.to_string()))?;
 
                 builder.position_at_end(body_block);
-                self.exception_targets.push(ExceptionTarget { block: handler_block });
+                self.exception_targets.push(ExceptionTarget {
+                    block: handler_block,
+                });
                 self.compile_tail_expr(
                     builder,
                     current_function,
-                    callable_kind,
                     current_signature,
                     env,
                     body,
@@ -774,14 +1013,17 @@ impl<'ctx> Compiler<'ctx> {
                     .map_err(|error| CompileError::Codegen(error.to_string()))?
                     .try_as_basic_value()
                     .basic()
-                    .ok_or_else(|| CompileError::Codegen("take-pending-exception did not return a value".into()))?
+                    .ok_or_else(|| {
+                        CompileError::Codegen(
+                            "take-pending-exception did not return a value".into(),
+                        )
+                    })?
                     .into_int_value();
                 let mut guarded_env = env.clone();
                 guarded_env.insert(name.to_string(), CodegenValue::Word(exception));
                 self.compile_tail_expr(
                     builder,
                     current_function,
-                    callable_kind,
                     current_signature,
                     &guarded_env,
                     handler,
@@ -791,7 +1033,6 @@ impl<'ctx> Compiler<'ctx> {
             ExprKind::Call { callee, args } => self.compile_tail_call(
                 builder,
                 current_function,
-                callable_kind,
                 current_signature,
                 env,
                 callee,
@@ -820,19 +1061,8 @@ impl<'ctx> Compiler<'ctx> {
         }
 
         let callee_value = self.compile_expr(builder, current_function, env, callee)?;
-        let signature = match callee_value {
-            CodegenValue::Function(info) => info.signature,
-            CodegenValue::Closure(info) => info.signature,
-            CodegenValue::Word(_)
-            | CodegenValue::RootedWord { .. }
-            | CodegenValue::HeapObject { .. }
-            | CodegenValue::MutableBox { .. } => {
-                return Err(CompileError::Codegen(
-                    "call target expected a function value, but a non-function was produced"
-                        .into(),
-                ));
-            }
-        };
+        let (callee_value, signature) =
+            self.resolve_callable_value(builder, callee_value, args.len())?;
         if args.len() < signature.required_param_kinds.len()
             || (!signature.rest && args.len() != signature.required_param_kinds.len())
         {
@@ -868,7 +1098,6 @@ impl<'ctx> Compiler<'ctx> {
         &mut self,
         builder: &Builder<'ctx>,
         current_function: FunctionValue<'ctx>,
-        callable_kind: CallableKind,
         current_signature: FunctionSignature,
         env: &HashMap<String, CodegenValue<'ctx>>,
         callee: &Expr,
@@ -877,7 +1106,8 @@ impl<'ctx> Compiler<'ctx> {
     ) -> Result<(), CompileError> {
         if let ExprKind::Variable(name) = &callee.kind {
             if is_builtin(name) && !env.contains_key(name) {
-                let result = self.compile_builtin_call(builder, current_function, env, name, args)?;
+                let result =
+                    self.compile_builtin_call(builder, current_function, env, name, args)?;
                 return self.tail_return_value(
                     builder,
                     cleanup_roots,
@@ -888,19 +1118,8 @@ impl<'ctx> Compiler<'ctx> {
         }
 
         let callee_value = self.compile_expr(builder, current_function, env, callee)?;
-        let signature = match callee_value {
-            CodegenValue::Function(info) => info.signature,
-            CodegenValue::Closure(info) => info.signature,
-            CodegenValue::Word(_)
-            | CodegenValue::RootedWord { .. }
-            | CodegenValue::HeapObject { .. }
-            | CodegenValue::MutableBox { .. } => {
-                return Err(CompileError::Codegen(
-                    "call target expected a function value, but a non-function was produced"
-                        .into(),
-                ));
-            }
-        };
+        let (callee_value, signature) =
+            self.resolve_callable_value(builder, callee_value, args.len())?;
         if args.len() < signature.required_param_kinds.len()
             || (!signature.rest && args.len() != signature.required_param_kinds.len())
         {
@@ -929,13 +1148,14 @@ impl<'ctx> Compiler<'ctx> {
             )?;
             compiled_args.push(rest_list.into());
         }
-        self.emit_tail_callable_return(
+        let args_list =
+            self.build_scheme_args_list(builder, signature, &compiled_args, "tail.call.args")?;
+        self.emit_tail_request(
             builder,
-            callable_kind,
-            current_signature,
+            current_signature.return_kind,
             callee_value,
             signature,
-            compiled_args,
+            args_list,
             cleanup_roots,
         )
     }
@@ -952,6 +1172,9 @@ impl<'ctx> Compiler<'ctx> {
             "+" | "-" | "*" | "/" => {
                 self.compile_numeric_builtin(builder, current_function, env, callee, args)
             }
+            "=" | "<" | ">" | "<=" | ">=" => {
+                self.compile_numeric_comparison(builder, current_function, env, callee, args)
+            }
             "not" => self.compile_not(builder, current_function, env, args),
             "boolean?" => self.compile_boolean_predicate(builder, current_function, env, args),
             "zero?" => self.compile_zero_predicate(builder, current_function, env, args),
@@ -959,19 +1182,11 @@ impl<'ctx> Compiler<'ctx> {
             "char=?" | "char<?" | "char>?" | "char<=?" | "char>=?" => {
                 self.compile_char_comparison(builder, current_function, env, callee, args)
             }
-            "char->integer" => {
-                self.compile_char_to_integer(builder, current_function, env, args)
-            }
-            "integer->char" => {
-                self.compile_integer_to_char(builder, current_function, env, args)
-            }
+            "char->integer" => self.compile_char_to_integer(builder, current_function, env, args),
+            "integer->char" => self.compile_integer_to_char(builder, current_function, env, args),
             "symbol?" => self.compile_symbol_predicate(builder, current_function, env, args),
-            "symbol->string" => {
-                self.compile_symbol_to_string(builder, current_function, env, args)
-            }
-            "string->symbol" => {
-                self.compile_string_to_symbol(builder, current_function, env, args)
-            }
+            "symbol->string" => self.compile_symbol_to_string(builder, current_function, env, args),
+            "string->symbol" => self.compile_string_to_symbol(builder, current_function, env, args),
             "procedure?" => self.compile_procedure_predicate(builder, current_function, env, args),
             "values" => self.compile_values(builder, current_function, env, args),
             "call-with-values" => {
@@ -988,12 +1203,22 @@ impl<'ctx> Compiler<'ctx> {
             "map" => self.compile_map(builder, current_function, env, args),
             "for-each" => self.compile_for_each(builder, current_function, env, args),
             "append" => self.compile_append(builder, current_function, env, args),
-            "memq" => {
-                self.compile_member_like(builder, current_function, env, args, self.runtime.memq, "memq")
-            }
-            "memv" => {
-                self.compile_member_like(builder, current_function, env, args, self.runtime.memv, "memv")
-            }
+            "memq" => self.compile_member_like(
+                builder,
+                current_function,
+                env,
+                args,
+                self.runtime.memq,
+                "memq",
+            ),
+            "memv" => self.compile_member_like(
+                builder,
+                current_function,
+                env,
+                args,
+                self.runtime.memv,
+                "memv",
+            ),
             "member" => self.compile_member_like(
                 builder,
                 current_function,
@@ -1002,15 +1227,30 @@ impl<'ctx> Compiler<'ctx> {
                 self.runtime.member,
                 "member",
             ),
-            "assq" => {
-                self.compile_member_like(builder, current_function, env, args, self.runtime.assq, "assq")
-            }
-            "assv" => {
-                self.compile_member_like(builder, current_function, env, args, self.runtime.assv, "assv")
-            }
-            "assoc" => {
-                self.compile_member_like(builder, current_function, env, args, self.runtime.assoc, "assoc")
-            }
+            "assq" => self.compile_member_like(
+                builder,
+                current_function,
+                env,
+                args,
+                self.runtime.assq,
+                "assq",
+            ),
+            "assv" => self.compile_member_like(
+                builder,
+                current_function,
+                env,
+                args,
+                self.runtime.assv,
+                "assv",
+            ),
+            "assoc" => self.compile_member_like(
+                builder,
+                current_function,
+                env,
+                args,
+                self.runtime.assoc,
+                "assoc",
+            ),
             "list-copy" => self.compile_list_copy(builder, current_function, env, args),
             "reverse" => self.compile_reverse(builder, current_function, env, args),
             "cons" => self.compile_cons(builder, current_function, env, args),
@@ -1057,17 +1297,23 @@ impl<'ctx> Compiler<'ctx> {
         )?;
         let thunk = match thunk {
             CodegenValue::Function(info) => {
-                self.allocate_placeholder_closure(builder, info.value, info.signature, 0)?
+                self.allocate_placeholder_closure(builder, info.wrapper, info.signature, 0)?
             }
             other => other,
         };
         let thunk_word = self.value_to_word(builder, thunk, "delay.thunk.word")?;
         let promise = builder
-            .build_call(self.runtime.alloc_promise_gc, &[thunk_word.into()], "promise.alloc")
+            .build_call(
+                self.runtime.alloc_promise_gc,
+                &[thunk_word.into()],
+                "promise.alloc",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
-            .ok_or_else(|| CompileError::Codegen("promise allocation did not return a value".into()))?
+            .ok_or_else(|| {
+                CompileError::Codegen("promise allocation did not return a value".into())
+            })?
             .into_pointer_value();
         Ok(CodegenValue::HeapObject {
             ptr: promise,
@@ -1102,22 +1348,36 @@ impl<'ctx> Compiler<'ctx> {
         promise_ptr: PointerValue<'ctx>,
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         let forced = builder
-            .build_call(self.runtime.promise_forced_gc, &[promise_ptr.into()], "promise.forced")
+            .build_call(
+                self.runtime.promise_forced_gc,
+                &[promise_ptr.into()],
+                "promise.forced",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
             .ok_or_else(|| CompileError::Codegen("promise-forced did not return a value".into()))?
             .into_int_value();
-        let forced_block = self.context.append_basic_block(current_function, "promise.forced");
-        let evaluate_block = self.context.append_basic_block(current_function, "promise.eval");
-        let merge_block = self.context.append_basic_block(current_function, "promise.merge");
+        let forced_block = self
+            .context
+            .append_basic_block(current_function, "promise.forced");
+        let evaluate_block = self
+            .context
+            .append_basic_block(current_function, "promise.eval");
+        let merge_block = self
+            .context
+            .append_basic_block(current_function, "promise.merge");
         builder
             .build_conditional_branch(forced, forced_block, evaluate_block)
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
 
         builder.position_at_end(forced_block);
         let forced_value = builder
-            .build_call(self.runtime.promise_value_gc, &[promise_ptr.into()], "promise.value")
+            .build_call(
+                self.runtime.promise_value_gc,
+                &[promise_ptr.into()],
+                "promise.value",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
@@ -1132,7 +1392,11 @@ impl<'ctx> Compiler<'ctx> {
 
         builder.position_at_end(evaluate_block);
         let thunk_word = builder
-            .build_call(self.runtime.promise_value_gc, &[promise_ptr.into()], "promise.thunk")
+            .build_call(
+                self.runtime.promise_value_gc,
+                &[promise_ptr.into()],
+                "promise.thunk",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
@@ -1179,7 +1443,10 @@ impl<'ctx> Compiler<'ctx> {
         let phi = builder
             .build_phi(self.context.i64_type(), "promise.result")
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
-        phi.add_incoming(&[(&forced_value, forced_block), (&resolved_word, evaluate_block)]);
+        phi.add_incoming(&[
+            (&forced_value, forced_block),
+            (&resolved_word, evaluate_block),
+        ]);
         Ok(CodegenValue::Word(phi.as_basic_value().into_int_value()))
     }
 
@@ -1190,33 +1457,55 @@ impl<'ctx> Compiler<'ctx> {
         promise_word: IntValue<'ctx>,
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         let forced = builder
-            .build_call(self.runtime.promise_forced, &[promise_word.into()], "promise.forced.word")
+            .build_call(
+                self.runtime.promise_forced,
+                &[promise_word.into()],
+                "promise.forced.word",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
             .ok_or_else(|| CompileError::Codegen("promise-forced did not return a value".into()))?
             .into_int_value();
-        let forced_block = self.context.append_basic_block(current_function, "promise.word.forced");
-        let evaluate_block = self.context.append_basic_block(current_function, "promise.word.eval");
-        let merge_block = self.context.append_basic_block(current_function, "promise.word.merge");
+        let forced_block = self
+            .context
+            .append_basic_block(current_function, "promise.word.forced");
+        let evaluate_block = self
+            .context
+            .append_basic_block(current_function, "promise.word.eval");
+        let merge_block = self
+            .context
+            .append_basic_block(current_function, "promise.word.merge");
         builder
             .build_conditional_branch(forced, forced_block, evaluate_block)
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
 
         builder.position_at_end(forced_block);
         let forced_value = builder
-            .build_call(self.runtime.promise_value, &[promise_word.into()], "promise.value.word")
+            .build_call(
+                self.runtime.promise_value,
+                &[promise_word.into()],
+                "promise.value.word",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
             .ok_or_else(|| CompileError::Codegen("promise-value did not return a value".into()))?
             .into_int_value();
-        builder.build_unconditional_branch(merge_block).map_err(|error| CompileError::Codegen(error.to_string()))?;
-        let forced_block = builder.get_insert_block().ok_or_else(|| CompileError::Codegen("missing promise word forced block".into()))?;
+        builder
+            .build_unconditional_branch(merge_block)
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        let forced_block = builder
+            .get_insert_block()
+            .ok_or_else(|| CompileError::Codegen("missing promise word forced block".into()))?;
 
         builder.position_at_end(evaluate_block);
         let thunk_word = builder
-            .build_call(self.runtime.promise_value, &[promise_word.into()], "promise.thunk.word")
+            .build_call(
+                self.runtime.promise_value,
+                &[promise_word.into()],
+                "promise.thunk.word",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
@@ -1228,7 +1517,11 @@ impl<'ctx> Compiler<'ctx> {
             rest: false,
         };
         let thunk_ptr = builder
-            .build_int_to_ptr(thunk_word, gc_ptr_type(self.context), "promise.word.thunk.ptr")
+            .build_int_to_ptr(
+                thunk_word,
+                gc_ptr_type(self.context),
+                "promise.word.thunk.ptr",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
         let result = self.emit_callable_call(
             builder,
@@ -1252,14 +1545,21 @@ impl<'ctx> Compiler<'ctx> {
             .basic()
             .ok_or_else(|| CompileError::Codegen("promise-resolve did not return a value".into()))?
             .into_int_value();
-        builder.build_unconditional_branch(merge_block).map_err(|error| CompileError::Codegen(error.to_string()))?;
-        let evaluate_block = builder.get_insert_block().ok_or_else(|| CompileError::Codegen("missing promise word eval block".into()))?;
+        builder
+            .build_unconditional_branch(merge_block)
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        let evaluate_block = builder
+            .get_insert_block()
+            .ok_or_else(|| CompileError::Codegen("missing promise word eval block".into()))?;
 
         builder.position_at_end(merge_block);
         let phi = builder
             .build_phi(self.context.i64_type(), "promise.word.result")
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
-        phi.add_incoming(&[(&forced_value, forced_block), (&resolved_word, evaluate_block)]);
+        phi.add_incoming(&[
+            (&forced_value, forced_block),
+            (&resolved_word, evaluate_block),
+        ]);
         Ok(CodegenValue::Word(phi.as_basic_value().into_int_value()))
     }
 
@@ -1284,12 +1584,15 @@ impl<'ctx> Compiler<'ctx> {
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
         let length = self.word_type().const_int(bytes.len() as u64, false);
         let call = builder
-            .build_call(self.runtime.alloc_string_gc, &[pointer.into(), length.into()], &name)
+            .build_call(
+                self.runtime.alloc_string_gc,
+                &[pointer.into(), length.into()],
+                &name,
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
-        let result = call
-            .try_as_basic_value()
-            .basic()
-            .ok_or_else(|| CompileError::Codegen("string literal allocation did not return a value".into()))?;
+        let result = call.try_as_basic_value().basic().ok_or_else(|| {
+            CompileError::Codegen("string literal allocation did not return a value".into())
+        })?;
         Ok(CodegenValue::HeapObject {
             ptr: result.into_pointer_value(),
             kind: HeapValueKind::String,
@@ -1317,12 +1620,15 @@ impl<'ctx> Compiler<'ctx> {
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
         let length = self.word_type().const_int(bytes.len() as u64, false);
         let call = builder
-            .build_call(self.runtime.alloc_symbol_gc, &[pointer.into(), length.into()], &name)
+            .build_call(
+                self.runtime.alloc_symbol_gc,
+                &[pointer.into(), length.into()],
+                &name,
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
-        let result = call
-            .try_as_basic_value()
-            .basic()
-            .ok_or_else(|| CompileError::Codegen("symbol literal allocation did not return a value".into()))?;
+        let result = call.try_as_basic_value().basic().ok_or_else(|| {
+            CompileError::Codegen("symbol literal allocation did not return a value".into())
+        })?;
         Ok(CodegenValue::HeapObject {
             ptr: result.into_pointer_value(),
             kind: HeapValueKind::Symbol,
@@ -1415,7 +1721,9 @@ impl<'ctx> Compiler<'ctx> {
         args: &[Expr],
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         if args.len() != 1 {
-            return Err(CompileError::Codegen("not expects exactly one argument".into()));
+            return Err(CompileError::Codegen(
+                "not expects exactly one argument".into(),
+            ));
         }
         let value = self.compile_expr(builder, current_function, env, &args[0])?;
         let predicate = match value {
@@ -1435,10 +1743,78 @@ impl<'ctx> Compiler<'ctx> {
             }
         };
         let tagged = builder
-            .build_select(predicate, self.const_bool(true), self.const_bool(false), "not.tagged")
+            .build_select(
+                predicate,
+                self.const_bool(true),
+                self.const_bool(false),
+                "not.tagged",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .into_int_value();
         Ok(CodegenValue::Word(tagged))
+    }
+
+    fn compile_numeric_comparison(
+        &mut self,
+        builder: &Builder<'ctx>,
+        current_function: FunctionValue<'ctx>,
+        env: &HashMap<String, CodegenValue<'ctx>>,
+        callee: &str,
+        args: &[Expr],
+    ) -> Result<CodegenValue<'ctx>, CompileError> {
+        if args.len() < 2 {
+            return Err(CompileError::Codegen(format!(
+                "{callee} expects at least two arguments"
+            )));
+        }
+
+        let mut decoded = Vec::with_capacity(args.len());
+        for (index, expr) in args.iter().enumerate() {
+            let value = self.compile_expr(builder, current_function, env, expr)?;
+            let word = self.expect_word(value, "numeric comparison argument")?;
+            let checked = self.ensure_fixnum(
+                builder,
+                current_function,
+                word,
+                &format!("num_cmp.{index}.fixnum.check"),
+            )?;
+            decoded.push(self.decode_fixnum(
+                builder,
+                checked,
+                &format!("num_cmp.{index}.fixnum"),
+            )?);
+        }
+
+        let predicate = match callee {
+            "=" => IntPredicate::EQ,
+            "<" => IntPredicate::SLT,
+            ">" => IntPredicate::SGT,
+            "<=" => IntPredicate::SLE,
+            ">=" => IntPredicate::SGE,
+            _ => unreachable!(),
+        };
+
+        let mut result = self.context.bool_type().const_int(1, false);
+        for pair in decoded.windows(2) {
+            let next = builder
+                .build_int_compare(predicate, pair[0], pair[1], "num_cmp.step")
+                .map_err(|error| CompileError::Codegen(error.to_string()))?;
+            result = builder
+                .build_and(result, next, "num_cmp.and")
+                .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        }
+
+        Ok(CodegenValue::Word(
+            builder
+                .build_select(
+                    result,
+                    self.const_bool(true),
+                    self.const_bool(false),
+                    "num_cmp.tagged",
+                )
+                .map_err(|error| CompileError::Codegen(error.to_string()))?
+                .into_int_value(),
+        ))
     }
 
     fn compile_apply(
@@ -1473,8 +1849,14 @@ impl<'ctx> Compiler<'ctx> {
         let list_arg = self.compile_expr(builder, current_function, env, args.last().unwrap())?;
         let list_word = self.value_to_word(builder, list_arg, "apply.list")?;
 
-        let compiled_args =
-            self.compile_apply_arguments(builder, current_function, env, signature, prefix_args, list_word)?;
+        let compiled_args = self.compile_apply_arguments(
+            builder,
+            current_function,
+            env,
+            signature,
+            prefix_args,
+            list_word,
+        )?;
         self.emit_callable_call(builder, callee_value, signature, compiled_args)
     }
 
@@ -1487,16 +1869,24 @@ impl<'ctx> Compiler<'ctx> {
         handler: &Expr,
         body: &Expr,
     ) -> Result<CodegenValue<'ctx>, CompileError> {
-        let body_block = self.context.append_basic_block(current_function, "guard.body");
-        let handler_block = self.context.append_basic_block(current_function, "guard.handler");
-        let merge_block = self.context.append_basic_block(current_function, "guard.merge");
+        let body_block = self
+            .context
+            .append_basic_block(current_function, "guard.body");
+        let handler_block = self
+            .context
+            .append_basic_block(current_function, "guard.handler");
+        let merge_block = self
+            .context
+            .append_basic_block(current_function, "guard.merge");
 
         builder
             .build_unconditional_branch(body_block)
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
 
         builder.position_at_end(body_block);
-        self.exception_targets.push(ExceptionTarget { block: handler_block });
+        self.exception_targets.push(ExceptionTarget {
+            block: handler_block,
+        });
         let body_result = self.compile_expr(builder, current_function, env, body)?;
         self.exception_targets.pop();
         builder
@@ -1516,7 +1906,9 @@ impl<'ctx> Compiler<'ctx> {
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
-            .ok_or_else(|| CompileError::Codegen("take-pending-exception did not return a value".into()))?
+            .ok_or_else(|| {
+                CompileError::Codegen("take-pending-exception did not return a value".into())
+            })?
             .into_int_value();
         let mut guarded_env = env.clone();
         guarded_env.insert(name.to_string(), CodegenValue::Word(exception));
@@ -1575,7 +1967,8 @@ impl<'ctx> Compiler<'ctx> {
                 )
                 .map_err(|error| CompileError::Codegen(error.to_string()))?;
             for (index, slot) in rooted_slots.iter().enumerate() {
-                let word = self.load_rooted_word(builder, *slot, &format!("values.arg.{index}.load"))?;
+                let word =
+                    self.load_rooted_word(builder, *slot, &format!("values.arg.{index}.load"))?;
                 let element_slot = unsafe {
                     builder.build_gep(
                         word_type,
@@ -1606,7 +1999,9 @@ impl<'ctx> Compiler<'ctx> {
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
-            .ok_or_else(|| CompileError::Codegen("values allocation did not return a value".into()))?
+            .ok_or_else(|| {
+                CompileError::Codegen("values allocation did not return a value".into())
+            })?
             .into_int_value();
         self.pop_root_slots(builder, rooted_slots.len())?;
         Ok(CodegenValue::Word(result))
@@ -1651,12 +2046,15 @@ impl<'ctx> Compiler<'ctx> {
                 ));
             }
         };
-        let rooted_consumer = self.root_callable_value(builder, consumer_value, "call_with_values.consumer")?;
+        let rooted_consumer =
+            self.root_callable_value(builder, consumer_value, "call_with_values.consumer")?;
 
-        let produced = self.emit_callable_call(builder, producer_value, producer_signature, Vec::new())?;
+        let produced =
+            self.emit_callable_call(builder, producer_value, producer_signature, Vec::new())?;
         let produced_word = self.value_to_word(builder, produced, "call_with_values.produced")?;
-        let CodegenValue::RootedWord { slot: produced_slot } =
-            self.root_word(builder, produced_word, "call_with_values.produced.root")?
+        let CodegenValue::RootedWord {
+            slot: produced_slot,
+        } = self.root_word(builder, produced_word, "call_with_values.produced.root")?
         else {
             unreachable!()
         };
@@ -1664,16 +2062,26 @@ impl<'ctx> Compiler<'ctx> {
         let current_word =
             self.load_rooted_word(builder, produced_slot, "call_with_values.produced.current")?;
         let is_values = builder
-            .build_call(self.runtime.is_values, &[current_word.into()], "call_with_values.is_values")
+            .build_call(
+                self.runtime.is_values,
+                &[current_word.into()],
+                "call_with_values.is_values",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
             .ok_or_else(|| CompileError::Codegen("is-values did not return a value".into()))?
             .into_int_value();
 
-        let values_block = self.context.append_basic_block(current_function, "call_with_values.values");
-        let single_block = self.context.append_basic_block(current_function, "call_with_values.single");
-        let cont_block = self.context.append_basic_block(current_function, "call_with_values.cont");
+        let values_block = self
+            .context
+            .append_basic_block(current_function, "call_with_values.values");
+        let single_block = self
+            .context
+            .append_basic_block(current_function, "call_with_values.single");
+        let cont_block = self
+            .context
+            .append_basic_block(current_function, "call_with_values.cont");
         builder
             .build_conditional_branch(is_values, values_block, single_block)
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -1740,7 +2148,9 @@ impl<'ctx> Compiler<'ctx> {
         args: &[Expr],
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         if args.len() != 1 {
-            return Err(CompileError::Codegen("raise expects exactly one argument".into()));
+            return Err(CompileError::Codegen(
+                "raise expects exactly one argument".into(),
+            ));
         }
         let value = self.compile_expr(builder, current_function, env, &args[0])?;
         let word = self.value_to_word(builder, value, "raise.argument")?;
@@ -1890,7 +2300,8 @@ impl<'ctx> Compiler<'ctx> {
         let mask = builder
             .build_and(
                 word,
-                self.word_type().const_int(crate::runtime::layout::IMMEDIATE_TAG_MASK as u64, false),
+                self.word_type()
+                    .const_int(crate::runtime::layout::IMMEDIATE_TAG_MASK as u64, false),
                 "char.mask",
             )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -1898,7 +2309,8 @@ impl<'ctx> Compiler<'ctx> {
             .build_int_compare(
                 IntPredicate::EQ,
                 mask,
-                self.word_type().const_int(crate::runtime::layout::CHAR_TAG as u64, false),
+                self.word_type()
+                    .const_int(crate::runtime::layout::CHAR_TAG as u64, false),
                 "char.is_char",
             )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -1935,7 +2347,8 @@ impl<'ctx> Compiler<'ctx> {
             let masked = builder
                 .build_and(
                     word,
-                    self.word_type().const_int(crate::runtime::layout::IMMEDIATE_TAG_MASK as u64, false),
+                    self.word_type()
+                        .const_int(crate::runtime::layout::IMMEDIATE_TAG_MASK as u64, false),
                     &format!("char_cmp.{index}.mask"),
                 )
                 .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -1943,16 +2356,23 @@ impl<'ctx> Compiler<'ctx> {
                 .build_int_compare(
                     IntPredicate::EQ,
                     masked,
-                    self.word_type().const_int(crate::runtime::layout::CHAR_TAG as u64, false),
+                    self.word_type()
+                        .const_int(crate::runtime::layout::CHAR_TAG as u64, false),
                     &format!("char_cmp.{index}.is_char"),
                 )
                 .map_err(|error| CompileError::Codegen(error.to_string()))?;
-            self.trap_if_false(builder, current_function, is_char, &format!("char_cmp.{index}"))?;
+            self.trap_if_false(
+                builder,
+                current_function,
+                is_char,
+                &format!("char_cmp.{index}"),
+            )?;
             decoded.push(
                 builder
                     .build_right_shift(
                         word,
-                        self.word_type().const_int(crate::runtime::layout::CHAR_SHIFT as u64, false),
+                        self.word_type()
+                            .const_int(crate::runtime::layout::CHAR_SHIFT as u64, false),
                         false,
                         &format!("char_cmp.{index}.decoded"),
                     )
@@ -1979,7 +2399,12 @@ impl<'ctx> Compiler<'ctx> {
         }
         Ok(CodegenValue::Word(
             builder
-                .build_select(result, self.const_bool(true), self.const_bool(false), "char_cmp.tagged")
+                .build_select(
+                    result,
+                    self.const_bool(true),
+                    self.const_bool(false),
+                    "char_cmp.tagged",
+                )
                 .map_err(|error| CompileError::Codegen(error.to_string()))?
                 .into_int_value(),
         ))
@@ -2002,7 +2427,8 @@ impl<'ctx> Compiler<'ctx> {
         let masked = builder
             .build_and(
                 word,
-                self.word_type().const_int(crate::runtime::layout::IMMEDIATE_TAG_MASK as u64, false),
+                self.word_type()
+                    .const_int(crate::runtime::layout::IMMEDIATE_TAG_MASK as u64, false),
                 "char_to_integer.mask",
             )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -2010,7 +2436,8 @@ impl<'ctx> Compiler<'ctx> {
             .build_int_compare(
                 IntPredicate::EQ,
                 masked,
-                self.word_type().const_int(crate::runtime::layout::CHAR_TAG as u64, false),
+                self.word_type()
+                    .const_int(crate::runtime::layout::CHAR_TAG as u64, false),
                 "char_to_integer.is_char",
             )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -2018,7 +2445,8 @@ impl<'ctx> Compiler<'ctx> {
         let decoded = builder
             .build_right_shift(
                 word,
-                self.word_type().const_int(crate::runtime::layout::CHAR_SHIFT as u64, false),
+                self.word_type()
+                    .const_int(crate::runtime::layout::CHAR_SHIFT as u64, false),
                 false,
                 "char_to_integer.decoded",
             )
@@ -2087,14 +2515,16 @@ impl<'ctx> Compiler<'ctx> {
         let shifted = builder
             .build_left_shift(
                 decoded,
-                self.word_type().const_int(crate::runtime::layout::CHAR_SHIFT as u64, false),
+                self.word_type()
+                    .const_int(crate::runtime::layout::CHAR_SHIFT as u64, false),
                 "integer_to_char.shifted",
             )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
         let tagged = builder
             .build_or(
                 shifted,
-                self.word_type().const_int(crate::runtime::layout::CHAR_TAG as u64, false),
+                self.word_type()
+                    .const_int(crate::runtime::layout::CHAR_TAG as u64, false),
                 "integer_to_char.tagged",
             )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -2385,7 +2815,8 @@ impl<'ctx> Compiler<'ctx> {
         let mut lengths = Vec::with_capacity(list_count);
         for (index, expr) in args[1..].iter().enumerate() {
             let list_value = self.compile_expr(builder, current_function, env, expr)?;
-            let list_word = self.value_to_word(builder, list_value, &format!("list_iter.list.{index}"))?;
+            let list_word =
+                self.value_to_word(builder, list_value, &format!("list_iter.list.{index}"))?;
             let slot = builder
                 .build_alloca(self.word_type(), &format!("list_iter.list.{index}.slot"))
                 .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -2400,18 +2831,36 @@ impl<'ctx> Compiler<'ctx> {
                 .map_err(|error| CompileError::Codegen(error.to_string()))?;
             list_slots.push(slot);
             let length = builder
-                .build_call(self.runtime.list_length, &[list_word.into()], &format!("list_iter.list.{index}.len"))
+                .build_call(
+                    self.runtime.list_length,
+                    &[list_word.into()],
+                    &format!("list_iter.list.{index}.len"),
+                )
                 .map_err(|error| CompileError::Codegen(error.to_string()))?
                 .try_as_basic_value()
                 .basic()
                 .ok_or_else(|| CompileError::Codegen("list-length did not return a value".into()))?
                 .into_int_value();
-            let checked = self.ensure_fixnum(builder, current_function, length, &format!("list_iter.list.{index}.len.fixnum"))?;
-            lengths.push(self.decode_fixnum(builder, checked, &format!("list_iter.list.{index}.len.decoded"))?);
+            let checked = self.ensure_fixnum(
+                builder,
+                current_function,
+                length,
+                &format!("list_iter.list.{index}.len.fixnum"),
+            )?;
+            lengths.push(self.decode_fixnum(
+                builder,
+                checked,
+                &format!("list_iter.list.{index}.len.decoded"),
+            )?);
         }
         for length in lengths.iter().skip(1) {
             let same = builder
-                .build_int_compare(IntPredicate::EQ, lengths[0], *length, "list_iter.same_length")
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    lengths[0],
+                    *length,
+                    "list_iter.same_length",
+                )
                 .map_err(|error| CompileError::Codegen(error.to_string()))?;
             self.trap_if_false(builder, current_function, same, "list_iter.same_length")?;
         }
@@ -2441,10 +2890,18 @@ impl<'ctx> Compiler<'ctx> {
             None
         };
 
-        let cond_block = self.context.append_basic_block(current_function, "list_iter.cond");
-        let body_block = self.context.append_basic_block(current_function, "list_iter.body");
-        let step_block = self.context.append_basic_block(current_function, "list_iter.step");
-        let done_block = self.context.append_basic_block(current_function, "list_iter.done");
+        let cond_block = self
+            .context
+            .append_basic_block(current_function, "list_iter.cond");
+        let body_block = self
+            .context
+            .append_basic_block(current_function, "list_iter.body");
+        let step_block = self
+            .context
+            .append_basic_block(current_function, "list_iter.step");
+        let done_block = self
+            .context
+            .append_basic_block(current_function, "list_iter.done");
         builder
             .build_unconditional_branch(cond_block)
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -2462,7 +2919,8 @@ impl<'ctx> Compiler<'ctx> {
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
 
         builder.position_at_end(body_block);
-        let mut iteration_args = Vec::with_capacity(signature.required_param_kinds.len() + usize::from(signature.rest));
+        let mut iteration_args =
+            Vec::with_capacity(signature.required_param_kinds.len() + usize::from(signature.rest));
         let direct_count = signature.required_param_kinds.len().min(list_slots.len());
         let mut extra_words = Vec::new();
         for (list_index, slot) in list_slots.iter().enumerate() {
@@ -2503,9 +2961,13 @@ impl<'ctx> Compiler<'ctx> {
             }
         }
         if signature.rest {
-            iteration_args.push(self.build_list_word_from_words(builder, &extra_words, "list_iter.rest")?.into());
+            iteration_args.push(
+                self.build_list_word_from_words(builder, &extra_words, "list_iter.rest")?
+                    .into(),
+            );
         }
-        let call_result = self.emit_rooted_callable_call(builder, callable, signature, iteration_args)?;
+        let call_result =
+            self.emit_rooted_callable_call(builder, callable, signature, iteration_args)?;
         if let Some(slot) = result_slot {
             let item_word = self.value_to_word(builder, call_result, "map.result.item")?;
             let current = builder
@@ -2526,7 +2988,11 @@ impl<'ctx> Compiler<'ctx> {
 
         builder.position_at_end(step_block);
         let next_index = builder
-            .build_int_add(index, self.word_type().const_int(1, false), "list_iter.next")
+            .build_int_add(
+                index,
+                self.word_type().const_int(1, false),
+                "list_iter.next",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
         builder
             .build_store(index_slot, next_index)
@@ -2550,7 +3016,10 @@ impl<'ctx> Compiler<'ctx> {
                 .into_int_value();
             CodegenValue::Word(final_result)
         } else {
-            CodegenValue::Word(self.word_type().const_int(Value::unspecified().bits() as u64, false))
+            CodegenValue::Word(
+                self.word_type()
+                    .const_int(Value::unspecified().bits() as u64, false),
+            )
         };
 
         if collect_results {
@@ -2573,7 +3042,9 @@ impl<'ctx> Compiler<'ctx> {
         name: &str,
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         if args.len() != 2 {
-            return Err(CompileError::Codegen(format!("{name} expects exactly two arguments")));
+            return Err(CompileError::Codegen(format!(
+                "{name} expects exactly two arguments"
+            )));
         }
         let key = self.compile_expr(builder, current_function, env, &args[0])?;
         let list = self.compile_expr(builder, current_function, env, &args[1])?;
@@ -2630,7 +3101,9 @@ impl<'ctx> Compiler<'ctx> {
         args: &[Expr],
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         if args.len() != 1 {
-            return Err(CompileError::Codegen("list-copy expects exactly one argument".into()));
+            return Err(CompileError::Codegen(
+                "list-copy expects exactly one argument".into(),
+            ));
         }
         let value = self.compile_expr(builder, current_function, env, &args[0])?;
         let word = self.value_to_word(builder, value, "list-copy argument")?;
@@ -2651,7 +3124,9 @@ impl<'ctx> Compiler<'ctx> {
         args: &[Expr],
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         if args.len() != 1 {
-            return Err(CompileError::Codegen("reverse expects exactly one argument".into()));
+            return Err(CompileError::Codegen(
+                "reverse expects exactly one argument".into(),
+            ));
         }
         let value = self.compile_expr(builder, current_function, env, &args[0])?;
         let word = self.value_to_word(builder, value, "reverse argument")?;
@@ -2685,7 +3160,11 @@ impl<'ctx> Compiler<'ctx> {
         let compiled = self.compile_expr(builder, current_function, env, value)?;
         let word = self.value_to_word(builder, compiled, "set! value")?;
         let result = builder
-            .build_call(self.runtime.box_set_gc, &[ptr.into(), word.into()], "box.set")
+            .build_call(
+                self.runtime.box_set_gc,
+                &[ptr.into(), word.into()],
+                "box.set",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
@@ -2815,7 +3294,9 @@ impl<'ctx> Compiler<'ctx> {
                 .map_err(|error| CompileError::Codegen(error.to_string()))?
                 .try_as_basic_value()
                 .basic()
-                .ok_or_else(|| CompileError::Codegen("pair mutation did not return a value".into()))?,
+                .ok_or_else(|| {
+                    CompileError::Codegen("pair mutation did not return a value".into())
+                })?,
             CodegenValue::RootedWord { slot } => {
                 let pair_word = self.load_rooted_word(builder, slot, "pair_set.rooted")?;
                 let pair_ptr = builder
@@ -2834,7 +3315,9 @@ impl<'ctx> Compiler<'ctx> {
                     .map_err(|error| CompileError::Codegen(error.to_string()))?
                     .try_as_basic_value()
                     .basic()
-                    .ok_or_else(|| CompileError::Codegen("pair mutation did not return a value".into()))?
+                    .ok_or_else(|| {
+                        CompileError::Codegen("pair mutation did not return a value".into())
+                    })?
             }
             other => {
                 let pair_word = self.value_to_word(builder, other, "pair-set target")?;
@@ -2851,7 +3334,9 @@ impl<'ctx> Compiler<'ctx> {
                     .map_err(|error| CompileError::Codegen(error.to_string()))?
                     .try_as_basic_value()
                     .basic()
-                    .ok_or_else(|| CompileError::Codegen("pair mutation did not return a value".into()))?
+                    .ok_or_else(|| {
+                        CompileError::Codegen("pair mutation did not return a value".into())
+                    })?
             }
         };
         Ok(CodegenValue::Word(result.into_int_value()))
@@ -2908,7 +3393,9 @@ impl<'ctx> Compiler<'ctx> {
         args: &[Expr],
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         if args.len() != 1 {
-            return Err(CompileError::Codegen("list? expects exactly one argument".into()));
+            return Err(CompileError::Codegen(
+                "list? expects exactly one argument".into(),
+            ));
         }
         let value = self.compile_expr(builder, current_function, env, &args[0])?;
         let result = match value {
@@ -2940,7 +3427,12 @@ impl<'ctx> Compiler<'ctx> {
             }
         };
         let tagged = builder
-            .build_select(result, self.const_bool(true), self.const_bool(false), "list?.tagged")
+            .build_select(
+                result,
+                self.const_bool(true),
+                self.const_bool(false),
+                "list?.tagged",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .into_int_value();
         Ok(CodegenValue::Word(tagged))
@@ -2954,7 +3446,9 @@ impl<'ctx> Compiler<'ctx> {
         args: &[Expr],
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         if args.len() != 1 {
-            return Err(CompileError::Codegen("length expects exactly one argument".into()));
+            return Err(CompileError::Codegen(
+                "length expects exactly one argument".into(),
+            ));
         }
         let value = self.compile_expr(builder, current_function, env, &args[0])?;
         let word = self.value_to_word(builder, value, "length argument")?;
@@ -2975,7 +3469,9 @@ impl<'ctx> Compiler<'ctx> {
         args: &[Expr],
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         if args.len() != 2 {
-            return Err(CompileError::Codegen("list-tail expects exactly two arguments".into()));
+            return Err(CompileError::Codegen(
+                "list-tail expects exactly two arguments".into(),
+            ));
         }
         let list = self.compile_expr(builder, current_function, env, &args[0])?;
         let index = self.compile_expr(builder, current_function, env, &args[1])?;
@@ -3005,7 +3501,9 @@ impl<'ctx> Compiler<'ctx> {
         args: &[Expr],
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         if args.len() != 2 {
-            return Err(CompileError::Codegen("list-ref expects exactly two arguments".into()));
+            return Err(CompileError::Codegen(
+                "list-ref expects exactly two arguments".into(),
+            ));
         }
         let list = self.compile_expr(builder, current_function, env, &args[0])?;
         let index = self.compile_expr(builder, current_function, env, &args[1])?;
@@ -3128,11 +3626,17 @@ impl<'ctx> Compiler<'ctx> {
                 ptr,
                 kind: HeapValueKind::String,
             } => builder
-                .build_call(self.runtime.string_length_gc, &[ptr.into()], "string_length_gc")
+                .build_call(
+                    self.runtime.string_length_gc,
+                    &[ptr.into()],
+                    "string_length_gc",
+                )
                 .map_err(|error| CompileError::Codegen(error.to_string()))?
                 .try_as_basic_value()
                 .basic()
-                .ok_or_else(|| CompileError::Codegen("string-length did not return a value".into()))?,
+                .ok_or_else(|| {
+                    CompileError::Codegen("string-length did not return a value".into())
+                })?,
             other => {
                 let word = self.value_to_word(builder, other, "string-length argument")?;
                 builder
@@ -3140,7 +3644,9 @@ impl<'ctx> Compiler<'ctx> {
                     .map_err(|error| CompileError::Codegen(error.to_string()))?
                     .try_as_basic_value()
                     .basic()
-                    .ok_or_else(|| CompileError::Codegen("string-length did not return a value".into()))?
+                    .ok_or_else(|| {
+                        CompileError::Codegen("string-length did not return a value".into())
+                    })?
             }
         };
         Ok(CodegenValue::Word(result.into_int_value()))
@@ -3170,13 +3676,18 @@ impl<'ctx> Compiler<'ctx> {
                 ptr,
                 kind: HeapValueKind::String,
             } => builder
-                .build_call(self.runtime.string_ref_gc, &[ptr.into(), index.into()], "string_ref_gc")
+                .build_call(
+                    self.runtime.string_ref_gc,
+                    &[ptr.into(), index.into()],
+                    "string_ref_gc",
+                )
                 .map_err(|error| CompileError::Codegen(error.to_string()))?
                 .try_as_basic_value()
                 .basic()
                 .ok_or_else(|| CompileError::Codegen("string-ref did not return a value".into()))?,
             other => {
-                let string_word = self.value_to_word(builder, other, "string-ref string argument")?;
+                let string_word =
+                    self.value_to_word(builder, other, "string-ref string argument")?;
                 builder
                     .build_call(
                         self.runtime.string_ref,
@@ -3186,7 +3697,9 @@ impl<'ctx> Compiler<'ctx> {
                     .map_err(|error| CompileError::Codegen(error.to_string()))?
                     .try_as_basic_value()
                     .basic()
-                    .ok_or_else(|| CompileError::Codegen("string-ref did not return a value".into()))?
+                    .ok_or_else(|| {
+                        CompileError::Codegen("string-ref did not return a value".into())
+                    })?
             }
         };
         Ok(CodegenValue::Word(result.into_int_value()))
@@ -3306,11 +3819,17 @@ impl<'ctx> Compiler<'ctx> {
                 ptr,
                 kind: HeapValueKind::Vector,
             } => builder
-                .build_call(self.runtime.vector_length_gc, &[ptr.into()], "vector_length_gc")
+                .build_call(
+                    self.runtime.vector_length_gc,
+                    &[ptr.into()],
+                    "vector_length_gc",
+                )
                 .map_err(|error| CompileError::Codegen(error.to_string()))?
                 .try_as_basic_value()
                 .basic()
-                .ok_or_else(|| CompileError::Codegen("vector-length did not return a value".into()))?,
+                .ok_or_else(|| {
+                    CompileError::Codegen("vector-length did not return a value".into())
+                })?,
             other => {
                 let word = self.value_to_word(builder, other, "vector-length argument")?;
                 builder
@@ -3318,7 +3837,9 @@ impl<'ctx> Compiler<'ctx> {
                     .map_err(|error| CompileError::Codegen(error.to_string()))?
                     .try_as_basic_value()
                     .basic()
-                    .ok_or_else(|| CompileError::Codegen("vector-length did not return a value".into()))?
+                    .ok_or_else(|| {
+                        CompileError::Codegen("vector-length did not return a value".into())
+                    })?
             }
         };
         Ok(CodegenValue::Word(result.into_int_value()))
@@ -3347,13 +3868,18 @@ impl<'ctx> Compiler<'ctx> {
                 ptr,
                 kind: HeapValueKind::Vector,
             } => builder
-                .build_call(self.runtime.vector_ref_gc, &[ptr.into(), index.into()], "vector_ref_gc")
+                .build_call(
+                    self.runtime.vector_ref_gc,
+                    &[ptr.into(), index.into()],
+                    "vector_ref_gc",
+                )
                 .map_err(|error| CompileError::Codegen(error.to_string()))?
                 .try_as_basic_value()
                 .basic()
                 .ok_or_else(|| CompileError::Codegen("vector-ref did not return a value".into()))?,
             other => {
-                let vector_word = self.value_to_word(builder, other, "vector-ref vector argument")?;
+                let vector_word =
+                    self.value_to_word(builder, other, "vector-ref vector argument")?;
                 builder
                     .build_call(
                         self.runtime.vector_ref,
@@ -3363,7 +3889,9 @@ impl<'ctx> Compiler<'ctx> {
                     .map_err(|error| CompileError::Codegen(error.to_string()))?
                     .try_as_basic_value()
                     .basic()
-                    .ok_or_else(|| CompileError::Codegen("vector-ref did not return a value".into()))?
+                    .ok_or_else(|| {
+                        CompileError::Codegen("vector-ref did not return a value".into())
+                    })?
             }
         };
         Ok(CodegenValue::Word(result.into_int_value()))
@@ -3402,9 +3930,12 @@ impl<'ctx> Compiler<'ctx> {
                 .map_err(|error| CompileError::Codegen(error.to_string()))?
                 .try_as_basic_value()
                 .basic()
-                .ok_or_else(|| CompileError::Codegen("vector-set! did not return a value".into()))?,
+                .ok_or_else(|| {
+                    CompileError::Codegen("vector-set! did not return a value".into())
+                })?,
             other => {
-                let vector_word = self.value_to_word(builder, other, "vector-set! vector argument")?;
+                let vector_word =
+                    self.value_to_word(builder, other, "vector-set! vector argument")?;
                 builder
                     .build_call(
                         self.runtime.vector_set,
@@ -3414,7 +3945,9 @@ impl<'ctx> Compiler<'ctx> {
                     .map_err(|error| CompileError::Codegen(error.to_string()))?
                     .try_as_basic_value()
                     .basic()
-                    .ok_or_else(|| CompileError::Codegen("vector-set! did not return a value".into()))?
+                    .ok_or_else(|| {
+                        CompileError::Codegen("vector-set! did not return a value".into())
+                    })?
             }
         };
         Ok(CodegenValue::Word(result.into_int_value()))
@@ -3457,7 +3990,8 @@ impl<'ctx> Compiler<'ctx> {
         }
         let iterations = self.compile_expr(builder, current_function, env, &args[0])?;
         let word = self.expect_word(iterations, "gc-stress iterations")?;
-        let checked = self.ensure_fixnum(builder, current_function, word, "gc_stress.iterations")?;
+        let checked =
+            self.ensure_fixnum(builder, current_function, word, "gc_stress.iterations")?;
         let decoded = self.decode_fixnum(builder, checked, "gc_stress.iterations.fixnum")?;
         let result = builder
             .build_call(self.runtime.gc_stress, &[decoded.into()], "gc_stress")
@@ -3499,9 +4033,7 @@ impl<'ctx> Compiler<'ctx> {
         args: &[Expr],
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         if !args.is_empty() {
-            return Err(CompileError::Codegen(
-                "newline expects no arguments".into(),
-            ));
+            return Err(CompileError::Codegen("newline expects no arguments".into()));
         }
         let result = builder
             .build_call(self.runtime.newline, &[], "newline")
@@ -3521,17 +4053,20 @@ impl<'ctx> Compiler<'ctx> {
             Datum::Integer(value) => Ok(CodegenValue::Word(self.const_fixnum_checked(*value)?)),
             Datum::Boolean(value) => Ok(CodegenValue::Word(self.const_bool(*value))),
             Datum::Char(value) => Ok(CodegenValue::Word(
-                self.word_type().const_int(Value::encode_char(*value).bits() as u64, false),
+                self.word_type()
+                    .const_int(Value::encode_char(*value).bits() as u64, false),
             )),
             Datum::String(value) => self.compile_string_literal(builder, value),
             Datum::Symbol(value) => self.compile_symbol_literal(builder, value),
-            Datum::List { items, tail } if items.is_empty() && tail.is_none() => {
-                Ok(CodegenValue::Word(self.word_type().const_int(EMPTY_LIST as u64, false)))
-            }
+            Datum::List { items, tail } if items.is_empty() && tail.is_none() => Ok(
+                CodegenValue::Word(self.word_type().const_int(EMPTY_LIST as u64, false)),
+            ),
             Datum::List { items, tail } => {
                 let mut result = match tail {
                     Some(tail) => self.compile_quote(builder, tail)?,
-                    None => CodegenValue::Word(self.word_type().const_int(EMPTY_LIST as u64, false)),
+                    None => {
+                        CodegenValue::Word(self.word_type().const_int(EMPTY_LIST as u64, false))
+                    }
                 };
                 for item in items.iter().rev() {
                     let car = self.compile_quote(builder, item)?;
@@ -3634,16 +4169,19 @@ impl<'ctx> Compiler<'ctx> {
         let mut binding_env = HashMap::new();
         for (name, value) in outer_env {
             let kind = match value {
-                CodegenValue::Word(_) | CodegenValue::RootedWord { .. } | CodegenValue::MutableBox { .. } => {
-                    BindingKind::Value(AbiValueKind::Word)
+                CodegenValue::Word(_)
+                | CodegenValue::RootedWord { .. }
+                | CodegenValue::MutableBox { .. } => BindingKind::Value(AbiValueKind::Word),
+                CodegenValue::HeapObject { kind, .. } => {
+                    BindingKind::Value(AbiValueKind::Heap(*kind))
                 }
-                CodegenValue::HeapObject { kind, .. } => BindingKind::Value(AbiValueKind::Heap(*kind)),
                 CodegenValue::Function(info) => BindingKind::Function(info.signature),
                 CodegenValue::Closure(info) => BindingKind::Function(info.signature),
             };
             binding_env.insert(name.clone(), kind);
         }
-        let function_signatures = self.infer_letrec_function_signatures_with_env(&binding_env, bindings);
+        let function_signatures =
+            self.infer_letrec_function_signatures_with_env(&binding_env, bindings);
         let mut provisional_env = outer_env.clone();
         let mut declared = Vec::new();
 
@@ -3665,6 +4203,12 @@ impl<'ctx> Compiler<'ctx> {
                 .copied()
                 .unwrap_or_else(|| self.default_signature(formals));
             let function = self.declare_closure_function(&function_name, signature);
+            let wrapper = self.module.add_function(
+                &format!("__scheme_wrap_{function_name}"),
+                self.scheme_wrapper_type(),
+                None,
+            );
+            attach_gc_strategy(wrapper);
             provisional_env.insert(
                 binding.name.clone(),
                 CodegenValue::Closure(ClosureInfo {
@@ -3675,6 +4219,7 @@ impl<'ctx> Compiler<'ctx> {
             declared.push((
                 binding.name.clone(),
                 function,
+                wrapper,
                 signature,
                 formals.clone(),
                 (**body).clone(),
@@ -3683,20 +4228,16 @@ impl<'ctx> Compiler<'ctx> {
 
         let mut captures_by_name: HashMap<String, Vec<(String, CaptureKind)>> = HashMap::new();
         let mut env = HashMap::new();
-        for (name, function, signature, formals, body) in &declared {
+        for (name, _function, wrapper, signature, formals, body) in &declared {
             let captures = self.collect_captures(&provisional_env, formals, body)?;
-            let closure_value = self.allocate_placeholder_closure(
-                builder,
-                *function,
-                *signature,
-                captures.len(),
-            )?;
+            let closure_value =
+                self.allocate_placeholder_closure(builder, *wrapper, *signature, captures.len())?;
             provisional_env.insert(name.clone(), closure_value);
             env.insert(name.clone(), closure_value);
             captures_by_name.insert(name.clone(), captures);
         }
 
-        for (name, _function, _signature, _params, _body) in &declared {
+        for (name, _function, _wrapper, _signature, _params, _body) in &declared {
             let closure = match env.get(name).copied() {
                 Some(CodegenValue::Closure(info)) => info,
                 _ => {
@@ -3731,11 +4272,12 @@ impl<'ctx> Compiler<'ctx> {
             }
         }
 
-        for (name, function, signature, formals, body) in declared {
+        for (name, function, wrapper, signature, formals, body) in declared {
             let captures = captures_by_name.remove(&name).ok_or_else(|| {
                 CompileError::Codegen(format!("missing letrec captures for '{}'", name))
             })?;
             self.compile_closure_body(function, signature, &formals, &captures, &body)?;
+            self.compile_closure_scheme_wrapper(wrapper, function, signature, &formals)?;
         }
 
         Ok(env)
@@ -3754,13 +4296,31 @@ impl<'ctx> Compiler<'ctx> {
         let captures = self.collect_captures(env, formals, body)?;
         if captures.is_empty() {
             let function = self.declare_lambda_function(&function_name, signature);
-            let info = FunctionInfo { value: function, signature };
+            let wrapper = self.module.add_function(
+                &format!("__scheme_wrap_{function_name}"),
+                self.scheme_wrapper_type(),
+                None,
+            );
+            attach_gc_strategy(wrapper);
+            let info = FunctionInfo {
+                value: function,
+                wrapper,
+                signature,
+            };
             self.compile_function_body(info, formals, body, &HashMap::new())?;
+            self.compile_direct_scheme_wrapper(info, formals)?;
             Ok(CodegenValue::Function(info))
         } else {
             let function = self.declare_closure_function(&function_name, signature);
+            let wrapper = self.module.add_function(
+                &format!("__scheme_wrap_{function_name}"),
+                self.scheme_wrapper_type(),
+                None,
+            );
+            attach_gc_strategy(wrapper);
             self.compile_closure_body(function, signature, formals, &captures, body)?;
-            self.compile_closure_allocation(builder, env, function, signature, &captures)
+            self.compile_closure_scheme_wrapper(wrapper, function, signature, formals)?;
+            self.compile_closure_allocation(builder, env, wrapper, signature, &captures)
         }
     }
 
@@ -3769,7 +4329,9 @@ impl<'ctx> Compiler<'ctx> {
         name: &str,
         signature: FunctionSignature,
     ) -> FunctionValue<'ctx> {
-        let function = self.module.add_function(name, self.function_type(signature), None);
+        let function = self
+            .module
+            .add_function(name, self.function_type(signature), None);
         attach_gc_strategy(function);
         function
     }
@@ -3812,8 +4374,9 @@ impl<'ctx> Compiler<'ctx> {
         signature: FunctionSignature,
     ) -> inkwell::types::FunctionType<'ctx> {
         let gc_ptr = gc_ptr_type(self.context);
-        let mut params: Vec<inkwell::types::BasicMetadataTypeEnum<'ctx>> =
-            Vec::with_capacity(signature.required_param_kinds.len() + 1 + usize::from(signature.rest));
+        let mut params: Vec<inkwell::types::BasicMetadataTypeEnum<'ctx>> = Vec::with_capacity(
+            signature.required_param_kinds.len() + 1 + usize::from(signature.rest),
+        );
         params.push(gc_ptr.into());
         for kind in signature.required_param_kinds {
             params.push(match kind {
@@ -3830,9 +4393,11 @@ impl<'ctx> Compiler<'ctx> {
         }
     }
 
-    fn closure_function_ptr_type(&self, signature: FunctionSignature) -> inkwell::types::PointerType<'ctx> {
-        let _ = signature;
-        self.context.ptr_type(inkwell::AddressSpace::default())
+    fn scheme_wrapper_type(&self) -> inkwell::types::FunctionType<'ctx> {
+        self.word_type().fn_type(
+            &[gc_ptr_type(self.context).into(), self.word_type().into()],
+            false,
+        )
     }
 
     fn load_closure_code_ptr(
@@ -3931,16 +4496,16 @@ impl<'ctx> Compiler<'ctx> {
             )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
         builder
-            .build_call(self.runtime.rt_root_slot_push, &[raw_ptr.into()], &format!("{name}.push"))
+            .build_call(
+                self.runtime.rt_root_slot_push,
+                &[raw_ptr.into()],
+                &format!("{name}.push"),
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
         Ok(CodegenValue::RootedWord { slot })
     }
 
-    fn pop_root_slots(
-        &self,
-        builder: &Builder<'ctx>,
-        count: usize,
-    ) -> Result<(), CompileError> {
+    fn pop_root_slots(&self, builder: &Builder<'ctx>, count: usize) -> Result<(), CompileError> {
         for _ in 0..count {
             builder
                 .build_call(self.runtime.rt_root_slot_pop, &[], "root.pop")
@@ -4044,12 +4609,80 @@ impl<'ctx> Compiler<'ctx> {
     ) -> Result<IntValue<'ctx>, CompileError> {
         let mut result = self.word_type().const_int(EMPTY_LIST as u64, false);
         for (index, value) in values.iter().enumerate().rev() {
-            let pair = self.alloc_pair_rooted(builder, *value, result, &format!("{name}.cons.{index}"))?;
+            let pair =
+                self.alloc_pair_rooted(builder, *value, result, &format!("{name}.cons.{index}"))?;
             result = builder
                 .build_ptr_to_int(pair, self.word_type(), &format!("{name}.word.{index}"))
                 .map_err(|error| CompileError::Codegen(error.to_string()))?;
         }
         Ok(result)
+    }
+
+    fn metadata_values_to_words(
+        &self,
+        builder: &Builder<'ctx>,
+        values: &[BasicMetadataValueEnum<'ctx>],
+        name: &str,
+    ) -> Result<Vec<IntValue<'ctx>>, CompileError> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| match value {
+                BasicMetadataValueEnum::IntValue(int) => Ok(*int),
+                BasicMetadataValueEnum::PointerValue(ptr) => builder
+                    .build_ptr_to_int(*ptr, self.word_type(), &format!("{name}.ptr.{index}"))
+                    .map_err(|error| CompileError::Codegen(error.to_string())),
+                other => Err(CompileError::Codegen(format!(
+                    "unsupported Scheme argument metadata value: {other:?}"
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn build_prefixed_list_word(
+        &self,
+        builder: &Builder<'ctx>,
+        prefix: &[IntValue<'ctx>],
+        tail: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, CompileError> {
+        let mut result = tail;
+        for (index, value) in prefix.iter().enumerate().rev() {
+            let pair =
+                self.alloc_pair_rooted(builder, *value, result, &format!("{name}.cons.{index}"))?;
+            result = builder
+                .build_ptr_to_int(pair, self.word_type(), &format!("{name}.word.{index}"))
+                .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        }
+        Ok(result)
+    }
+
+    fn build_scheme_args_list(
+        &self,
+        builder: &Builder<'ctx>,
+        signature: FunctionSignature,
+        values: &[BasicMetadataValueEnum<'ctx>],
+        name: &str,
+    ) -> Result<IntValue<'ctx>, CompileError> {
+        let words = self.metadata_values_to_words(builder, values, name)?;
+        let required = signature.required_param_kinds.len();
+        if !signature.rest {
+            if words.len() != required {
+                return Err(CompileError::Codegen(format!(
+                    "non-variadic callable expected {required} worker arguments but got {}",
+                    words.len()
+                )));
+            }
+            return self.build_list_word_from_words(builder, &words, name);
+        }
+        if words.len() != required + 1 {
+            return Err(CompileError::Codegen(format!(
+                "variadic callable expected {} worker arguments but got {}",
+                required + 1,
+                words.len()
+            )));
+        }
+        self.build_prefixed_list_word(builder, &words[..required], words[required], name)
     }
 
     fn root_callable_value(
@@ -4085,13 +4718,21 @@ impl<'ctx> Compiler<'ctx> {
         compiled_args: Vec<BasicMetadataValueEnum<'ctx>>,
     ) -> Result<CodegenValue<'ctx>, CompileError> {
         match callee_value {
-            RootedCallable::Function(info) => {
-                self.emit_callable_call(builder, CodegenValue::Function(info), signature, compiled_args)
-            }
+            RootedCallable::Function(info) => self.emit_callable_call(
+                builder,
+                CodegenValue::Function(info),
+                signature,
+                compiled_args,
+            ),
             RootedCallable::Closure { slot, signature } => {
-                let closure_word = self.load_rooted_word(builder, slot, "rooted_callable.closure")?;
+                let closure_word =
+                    self.load_rooted_word(builder, slot, "rooted_callable.closure")?;
                 let ptr = builder
-                    .build_int_to_ptr(closure_word, gc_ptr_type(self.context), "rooted_callable.closure.ptr")
+                    .build_int_to_ptr(
+                        closure_word,
+                        gc_ptr_type(self.context),
+                        "rooted_callable.closure.ptr",
+                    )
                     .map_err(|error| CompileError::Codegen(error.to_string()))?;
                 self.emit_callable_call(
                     builder,
@@ -4135,7 +4776,12 @@ impl<'ctx> Compiler<'ctx> {
         if !signature.rest {
             self.assert_list_length(builder, current_function, list_word, needed_from_list)?;
         } else if prefix_args.len() <= required {
-            self.assert_list_length_at_least(builder, current_function, list_word, needed_from_list)?;
+            self.assert_list_length_at_least(
+                builder,
+                current_function,
+                list_word,
+                needed_from_list,
+            )?;
         }
 
         for index in 0..needed_from_list {
@@ -4232,7 +4878,9 @@ impl<'ctx> Compiler<'ctx> {
                 .map_err(|error| CompileError::Codegen(error.to_string()))?
                 .try_as_basic_value()
                 .basic()
-                .ok_or_else(|| CompileError::Codegen("values-tail-list did not return a value".into()))?
+                .ok_or_else(|| {
+                    CompileError::Codegen("values-tail-list did not return a value".into())
+                })?
                 .into_int_value();
             compiled_args.push(rest.into());
         }
@@ -4282,7 +4930,11 @@ impl<'ctx> Compiler<'ctx> {
 
         if signature.rest {
             let rest_list = if signature.required_param_kinds.is_empty() {
-                self.build_list_word_from_words(builder, &[produced_word], "call_with_values.single.rest")?
+                self.build_list_word_from_words(
+                    builder,
+                    &[produced_word],
+                    "call_with_values.single.rest",
+                )?
             } else {
                 self.word_type().const_int(EMPTY_LIST as u64, false)
             };
@@ -4409,13 +5061,18 @@ impl<'ctx> Compiler<'ctx> {
         expected: usize,
     ) -> Result<(), CompileError> {
         let length = builder
-            .build_call(self.runtime.list_length, &[list_word.into()], "apply.length")
+            .build_call(
+                self.runtime.list_length,
+                &[list_word.into()],
+                "apply.length",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
             .ok_or_else(|| CompileError::Codegen("list-length did not return a value".into()))?
             .into_int_value();
-        let checked = self.ensure_fixnum(builder, current_function, length, "apply.length.fixnum")?;
+        let checked =
+            self.ensure_fixnum(builder, current_function, length, "apply.length.fixnum")?;
         let decoded = self.decode_fixnum(builder, checked, "apply.length.decoded")?;
         let predicate = builder
             .build_int_compare(
@@ -4436,13 +5093,18 @@ impl<'ctx> Compiler<'ctx> {
         minimum: usize,
     ) -> Result<(), CompileError> {
         let length = builder
-            .build_call(self.runtime.list_length, &[list_word.into()], "apply.length")
+            .build_call(
+                self.runtime.list_length,
+                &[list_word.into()],
+                "apply.length",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
             .ok_or_else(|| CompileError::Codegen("list-length did not return a value".into()))?
             .into_int_value();
-        let checked = self.ensure_fixnum(builder, current_function, length, "apply.length.fixnum")?;
+        let checked =
+            self.ensure_fixnum(builder, current_function, length, "apply.length.fixnum")?;
         let decoded = self.decode_fixnum(builder, checked, "apply.length.decoded")?;
         let predicate = builder
             .build_int_compare(
@@ -4463,16 +5125,23 @@ impl<'ctx> Compiler<'ctx> {
         expected: usize,
     ) -> Result<(), CompileError> {
         let length = builder
-            .build_call(self.runtime.values_length, &[values_word.into()], "call_with_values.length")
+            .build_call(
+                self.runtime.values_length,
+                &[values_word.into()],
+                "call_with_values.length",
+            )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
             .ok_or_else(|| CompileError::Codegen("values-length did not return a value".into()))?
             .into_int_value();
-        let checked =
-            self.ensure_fixnum(builder, current_function, length, "call_with_values.length.fixnum")?;
-        let decoded =
-            self.decode_fixnum(builder, checked, "call_with_values.length.decoded")?;
+        let checked = self.ensure_fixnum(
+            builder,
+            current_function,
+            length,
+            "call_with_values.length.fixnum",
+        )?;
+        let decoded = self.decode_fixnum(builder, checked, "call_with_values.length.decoded")?;
         let predicate = builder
             .build_int_compare(
                 IntPredicate::EQ,
@@ -4481,7 +5150,12 @@ impl<'ctx> Compiler<'ctx> {
                 "call_with_values.length.matches",
             )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
-        self.trap_if_false(builder, current_function, predicate, "call_with_values.length")
+        self.trap_if_false(
+            builder,
+            current_function,
+            predicate,
+            "call_with_values.length",
+        )
     }
 
     fn assert_values_length_at_least(
@@ -4502,10 +5176,13 @@ impl<'ctx> Compiler<'ctx> {
             .basic()
             .ok_or_else(|| CompileError::Codegen("values-length did not return a value".into()))?
             .into_int_value();
-        let checked =
-            self.ensure_fixnum(builder, current_function, length, "call_with_values.length.fixnum")?;
-        let decoded =
-            self.decode_fixnum(builder, checked, "call_with_values.length.decoded")?;
+        let checked = self.ensure_fixnum(
+            builder,
+            current_function,
+            length,
+            "call_with_values.length.fixnum",
+        )?;
+        let decoded = self.decode_fixnum(builder, checked, "call_with_values.length.decoded")?;
         let predicate = builder
             .build_int_compare(
                 IntPredicate::UGE,
@@ -4514,7 +5191,12 @@ impl<'ctx> Compiler<'ctx> {
                 "call_with_values.length.at_least",
             )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
-        self.trap_if_false(builder, current_function, predicate, "call_with_values.length")
+        self.trap_if_false(
+            builder,
+            current_function,
+            predicate,
+            "call_with_values.length",
+        )
     }
 
     fn trap_if_false(
@@ -4524,8 +5206,12 @@ impl<'ctx> Compiler<'ctx> {
         predicate: IntValue<'ctx>,
         name: &str,
     ) -> Result<(), CompileError> {
-        let ok_block = self.context.append_basic_block(current_function, &format!("{name}.ok"));
-        let trap_block = self.context.append_basic_block(current_function, &format!("{name}.trap"));
+        let ok_block = self
+            .context
+            .append_basic_block(current_function, &format!("{name}.ok"));
+        let trap_block = self
+            .context
+            .append_basic_block(current_function, &format!("{name}.trap"));
         builder
             .build_conditional_branch(predicate, ok_block, trap_block)
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -4550,15 +5236,13 @@ impl<'ctx> Compiler<'ctx> {
             return Ok(value);
         };
         let pending = builder
-            .build_call(
-                self.runtime.rt_exception_pending,
-                &[],
-                "exception.pending",
-            )
+            .build_call(self.runtime.rt_exception_pending, &[], "exception.pending")
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
-            .ok_or_else(|| CompileError::Codegen("exception-pending did not return a value".into()))?
+            .ok_or_else(|| {
+                CompileError::Codegen("exception-pending did not return a value".into())
+            })?
             .into_int_value();
         let cont = self
             .context
@@ -4570,6 +5254,36 @@ impl<'ctx> Compiler<'ctx> {
         Ok(value)
     }
 
+    fn scheme_callable_parts(
+        &self,
+        builder: &Builder<'ctx>,
+        callee_value: CodegenValue<'ctx>,
+    ) -> Result<(IntValue<'ctx>, IntValue<'ctx>, FunctionSignature), CompileError> {
+        match callee_value {
+            CodegenValue::Function(info) => {
+                let code_ptr = builder
+                    .build_ptr_to_int(
+                        info.wrapper.as_global_value().as_pointer_value(),
+                        self.word_type(),
+                        "scheme.callable.code",
+                    )
+                    .map_err(|error| CompileError::Codegen(error.to_string()))?;
+                Ok((code_ptr, self.word_type().const_zero(), info.signature))
+            }
+            CodegenValue::Closure(info) => {
+                let code_ptr =
+                    self.load_closure_code_ptr(builder, info.ptr, "scheme.callable.code")?;
+                let closure_word = builder
+                    .build_ptr_to_int(info.ptr, self.word_type(), "scheme.callable.closure")
+                    .map_err(|error| CompileError::Codegen(error.to_string()))?;
+                Ok((code_ptr, closure_word, info.signature))
+            }
+            _ => Err(CompileError::Codegen(
+                "call target expected a function value, but a non-function was produced".into(),
+            )),
+        }
+    }
+
     fn emit_callable_call(
         &self,
         builder: &Builder<'ctx>,
@@ -4577,166 +5291,91 @@ impl<'ctx> Compiler<'ctx> {
         signature: FunctionSignature,
         compiled_args: Vec<BasicMetadataValueEnum<'ctx>>,
     ) -> Result<CodegenValue<'ctx>, CompileError> {
-        match callee_value {
-            CodegenValue::Function(target) => {
-                if target.value.count_params() as usize != compiled_args.len() {
-                    return Err(CompileError::Codegen(format!(
-                        "procedure expects {} arguments but got {}",
-                        target.value.count_params(),
-                        compiled_args.len()
-                    )));
-                }
-                let call = builder
-                    .build_call(target.value, &compiled_args, "calltmp")
-                    .map_err(|error| CompileError::Codegen(error.to_string()))?;
-                let result = call
-                    .try_as_basic_value()
-                    .basic()
-                    .ok_or_else(|| CompileError::Codegen("call did not return a value".into()))?;
-                self.wrap_call_result(signature.return_kind, result)
-            }
-            CodegenValue::Closure(target) => {
-                let code_ptr = self.load_closure_code_ptr(builder, target.ptr, "closure.code")?;
-                let function_ptr = builder
-                    .build_int_to_ptr(
-                        code_ptr,
-                        self.closure_function_ptr_type(signature),
-                        "closure.fn",
-                    )
-                    .map_err(|error| CompileError::Codegen(error.to_string()))?;
-                let mut closure_args = Vec::with_capacity(compiled_args.len() + 1);
-                closure_args.push(target.ptr.into());
-                closure_args.extend(compiled_args);
-                let call = builder
-                    .build_indirect_call(
-                        self.closure_function_type(signature),
-                        function_ptr,
-                        &closure_args,
-                        "closure.call",
-                    )
-                    .map_err(|error| CompileError::Codegen(error.to_string()))?;
-                let result = call
-                    .try_as_basic_value()
-                    .basic()
-                    .ok_or_else(|| CompileError::Codegen("call did not return a value".into()))?;
-                self.wrap_call_result(signature.return_kind, result)
-            }
-            _ => Err(CompileError::Codegen(
-                "call target expected a function value, but a non-function was produced".into(),
-            )),
-        }
+        let args_list =
+            self.build_scheme_args_list(builder, signature, &compiled_args, "call.args")?;
+        self.emit_trampoline_call(builder, callee_value, signature, args_list)
     }
 
-    fn tail_call_compatible(
+    fn emit_trampoline_call(
         &self,
-        current_kind: CallableKind,
-        current_signature: FunctionSignature,
+        builder: &Builder<'ctx>,
         callee_value: CodegenValue<'ctx>,
-        callee_signature: FunctionSignature,
-    ) -> bool {
-        if current_signature != callee_signature {
-            return false;
+        signature: FunctionSignature,
+        args_list: IntValue<'ctx>,
+    ) -> Result<CodegenValue<'ctx>, CompileError> {
+        let (code_ptr, closure_word, callee_signature) =
+            self.scheme_callable_parts(builder, callee_value)?;
+        if callee_signature != signature {
+            return Err(CompileError::Codegen(
+                "mismatched callable signature during trampoline call".into(),
+            ));
         }
-        matches!(
-            (current_kind, callee_value),
-            (CallableKind::Direct, CodegenValue::Function(_))
-                | (CallableKind::Closure, CodegenValue::Closure(_))
+        let result = builder
+            .build_call(
+                self.runtime.rt_trampoline_apply,
+                &[code_ptr.into(), closure_word.into(), args_list.into()],
+                "trampoline.call",
+            )
+            .map_err(|error| CompileError::Codegen(error.to_string()))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CompileError::Codegen("trampoline call did not return a value".into()))?
+            .into_int_value();
+        self.word_to_codegen_value(
+            builder,
+            result,
+            signature.return_kind,
+            "trampoline.call.result",
         )
     }
 
-    fn emit_tail_callable_return(
-        &self,
-        builder: &Builder<'ctx>,
-        current_kind: CallableKind,
-        current_signature: FunctionSignature,
-        callee_value: CodegenValue<'ctx>,
-        callee_signature: FunctionSignature,
-        compiled_args: Vec<BasicMetadataValueEnum<'ctx>>,
-        cleanup_roots: usize,
-    ) -> Result<(), CompileError> {
-        let use_musttail = self.tail_call_compatible(
-            current_kind,
-            current_signature,
-            callee_value,
-            callee_signature,
-        );
-        self.pop_root_slots(builder, cleanup_roots)?;
-        match callee_value {
-            CodegenValue::Function(target) => {
-                if target.value.count_params() as usize != compiled_args.len() {
-                    return Err(CompileError::Codegen(format!(
-                        "procedure expects {} arguments but got {}",
-                        target.value.count_params(),
-                        compiled_args.len()
-                    )));
-                }
-                let call = builder
-                    .build_call(target.value, &compiled_args, "tail.call")
-                    .map_err(|error| CompileError::Codegen(error.to_string()))?;
-                if use_musttail {
-                    call.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindTail);
-                }
-                let result = call
-                    .try_as_basic_value()
-                    .basic()
-                    .ok_or_else(|| CompileError::Codegen("call did not return a value".into()))?;
-                self.build_tail_return_from_basic_value(builder, current_signature.return_kind, result)
-            }
-            CodegenValue::Closure(target) => {
-                let code_ptr = self.load_closure_code_ptr(builder, target.ptr, "closure.tail.code")?;
-                let function_ptr = builder
-                    .build_int_to_ptr(
-                        code_ptr,
-                        self.closure_function_ptr_type(callee_signature),
-                        "closure.tail.fn",
-                    )
-                    .map_err(|error| CompileError::Codegen(error.to_string()))?;
-                let mut closure_args = Vec::with_capacity(compiled_args.len() + 1);
-                closure_args.push(target.ptr.into());
-                closure_args.extend(compiled_args);
-                let call = builder
-                    .build_indirect_call(
-                        self.closure_function_type(callee_signature),
-                        function_ptr,
-                        &closure_args,
-                        "closure.tail.call",
-                    )
-                    .map_err(|error| CompileError::Codegen(error.to_string()))?;
-                if use_musttail {
-                    call.set_tail_call_kind(LLVMTailCallKind::LLVMTailCallKindTail);
-                }
-                let result = call
-                    .try_as_basic_value()
-                    .basic()
-                    .ok_or_else(|| CompileError::Codegen("call did not return a value".into()))?;
-                self.build_tail_return_from_basic_value(builder, current_signature.return_kind, result)
-            }
-            _ => Err(CompileError::Codegen(
-                "call target expected a function value, but a non-function was produced".into(),
-            )),
-        }
-    }
-
-    fn build_tail_return_from_basic_value(
+    fn emit_tail_request(
         &self,
         builder: &Builder<'ctx>,
         return_kind: AbiValueKind,
-        value: inkwell::values::BasicValueEnum<'ctx>,
+        callee_value: CodegenValue<'ctx>,
+        signature: FunctionSignature,
+        args_list: IntValue<'ctx>,
+        cleanup_roots: usize,
     ) -> Result<(), CompileError> {
+        let (code_ptr, closure_word, callee_signature) =
+            self.scheme_callable_parts(builder, callee_value)?;
+        if callee_signature != signature {
+            return Err(CompileError::Codegen(
+                "mismatched callable signature during tail request".into(),
+            ));
+        }
+        self.pop_root_slots(builder, cleanup_roots)?;
+        builder
+            .build_call(
+                self.runtime.rt_tail_invoke,
+                &[code_ptr.into(), closure_word.into(), args_list.into()],
+                "tail.invoke",
+            )
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
         match return_kind {
             AbiValueKind::Word => {
+                let marker = builder
+                    .build_call(self.runtime.rt_tail_call_marker, &[], "tail.marker")
+                    .map_err(|error| CompileError::Codegen(error.to_string()))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| {
+                        CompileError::Codegen("tail marker did not return a value".into())
+                    })?
+                    .into_int_value();
                 builder
-                    .build_return(Some(&value.into_int_value()))
+                    .build_return(Some(&marker))
                     .map_err(|error| CompileError::Codegen(error.to_string()))?;
-                Ok(())
             }
             AbiValueKind::Heap(_) => {
+                let null = gc_ptr_type(self.context).const_null();
                 builder
-                    .build_return(Some(&value.into_pointer_value()))
+                    .build_return(Some(&null))
                     .map_err(|error| CompileError::Codegen(error.to_string()))?;
-                Ok(())
             }
         }
+        Ok(())
     }
 
     fn tail_return_value(
@@ -4784,7 +5423,9 @@ impl<'ctx> Compiler<'ctx> {
         }
         match return_kind {
             AbiValueKind::Word => {
-                let value = self.word_type().const_int(Value::unspecified().bits() as u64, false);
+                let value = self
+                    .word_type()
+                    .const_int(Value::unspecified().bits() as u64, false);
                 builder
                     .build_return(Some(&value))
                     .map_err(|error| CompileError::Codegen(error.to_string()))?;
@@ -4808,6 +5449,53 @@ impl<'ctx> Compiler<'ctx> {
         }
     }
 
+    fn dynamic_callable_signature(&self, arity: usize) -> FunctionSignature {
+        let param_kinds = vec![AbiValueKind::Word; arity].into_boxed_slice();
+        FunctionSignature {
+            return_kind: AbiValueKind::Word,
+            required_param_kinds: Box::leak(param_kinds),
+            rest: false,
+        }
+    }
+
+    fn resolve_callable_value(
+        &self,
+        builder: &Builder<'ctx>,
+        value: CodegenValue<'ctx>,
+        arg_count: usize,
+    ) -> Result<(CodegenValue<'ctx>, FunctionSignature), CompileError> {
+        match value {
+            CodegenValue::Function(info) => Ok((CodegenValue::Function(info), info.signature)),
+            CodegenValue::Closure(info) => Ok((CodegenValue::Closure(info), info.signature)),
+            CodegenValue::Word(word) => {
+                let signature = self.dynamic_callable_signature(arg_count);
+                let ptr = builder
+                    .build_int_to_ptr(word, gc_ptr_type(self.context), "dynamic.callable.ptr")
+                    .map_err(|error| CompileError::Codegen(error.to_string()))?;
+                Ok((
+                    CodegenValue::Closure(ClosureInfo { ptr, signature }),
+                    signature,
+                ))
+            }
+            CodegenValue::RootedWord { slot } => {
+                let signature = self.dynamic_callable_signature(arg_count);
+                let word = self.load_rooted_word(builder, slot, "dynamic.callable.word")?;
+                let ptr = builder
+                    .build_int_to_ptr(word, gc_ptr_type(self.context), "dynamic.callable.ptr")
+                    .map_err(|error| CompileError::Codegen(error.to_string()))?;
+                Ok((
+                    CodegenValue::Closure(ClosureInfo { ptr, signature }),
+                    signature,
+                ))
+            }
+            CodegenValue::HeapObject { .. } | CodegenValue::MutableBox { .. } => {
+                Err(CompileError::Codegen(
+                    "call target expected a function value, but a non-function was produced".into(),
+                ))
+            }
+        }
+    }
+
     fn infer_top_level_function_signatures(
         &self,
         program: &Program,
@@ -4816,7 +5504,8 @@ impl<'ctx> Compiler<'ctx> {
         for item in &program.items {
             if let TopLevel::Procedure(procedure) = item {
                 let mut env = HashMap::new();
-                let param_kinds = self.infer_param_kinds(&procedure.formals.required, &procedure.body);
+                let param_kinds =
+                    self.infer_param_kinds(&procedure.formals.required, &procedure.body);
                 for (param, kind) in procedure
                     .formals
                     .required
@@ -4861,19 +5550,22 @@ impl<'ctx> Compiler<'ctx> {
         for _ in 0..bindings.len().max(1) {
             let mut next = functions.clone();
             for binding in bindings {
-                let ExprKind::Lambda { formals: params, body } = &binding.value.kind else {
+                let ExprKind::Lambda {
+                    formals: params,
+                    body,
+                } = &binding.value.kind
+                else {
                     continue;
                 };
                 let mut env = outer_env.clone();
                 for other in bindings {
                     if matches!(other.value.kind, ExprKind::Lambda { .. }) {
-                        let signature = functions
-                            .get(&other.name)
-                            .copied()
-                            .unwrap_or_else(|| self.default_signature(&Formals {
+                        let signature = functions.get(&other.name).copied().unwrap_or_else(|| {
+                            self.default_signature(&Formals {
                                 required: Vec::new(),
                                 rest: None,
-                            }));
+                            })
+                        });
                         env.insert(other.name.clone(), BindingKind::Function(signature));
                     }
                 }
@@ -4900,10 +5592,12 @@ impl<'ctx> Compiler<'ctx> {
         let mut binding_env: HashMap<String, BindingKind> = HashMap::new();
         for (name, value) in value_env {
             let kind = match value {
-                CodegenValue::Word(_) | CodegenValue::RootedWord { .. } | CodegenValue::MutableBox { .. } => {
-                    BindingKind::Value(AbiValueKind::Word)
+                CodegenValue::Word(_)
+                | CodegenValue::RootedWord { .. }
+                | CodegenValue::MutableBox { .. } => BindingKind::Value(AbiValueKind::Word),
+                CodegenValue::HeapObject { kind, .. } => {
+                    BindingKind::Value(AbiValueKind::Heap(*kind))
                 }
-                CodegenValue::HeapObject { kind, .. } => BindingKind::Value(AbiValueKind::Heap(*kind)),
                 CodegenValue::Function(info) => BindingKind::Function(info.signature),
                 CodegenValue::Closure(info) => BindingKind::Function(info.signature),
             };
@@ -4941,9 +5635,10 @@ impl<'ctx> Compiler<'ctx> {
         functions: &HashMap<String, FunctionSignature>,
     ) -> AbiValueKind {
         match &expr.kind {
-            ExprKind::Unspecified | ExprKind::Integer(_) | ExprKind::Boolean(_) | ExprKind::Char(_) => {
-                AbiValueKind::Word
-            }
+            ExprKind::Unspecified
+            | ExprKind::Integer(_)
+            | ExprKind::Boolean(_)
+            | ExprKind::Char(_) => AbiValueKind::Word,
             ExprKind::Quote(datum) => self.infer_quote_kind(datum),
             ExprKind::String(_) => AbiValueKind::Heap(HeapValueKind::String),
             ExprKind::Variable(name) => match env.get(name) {
@@ -4959,7 +5654,11 @@ impl<'ctx> Compiler<'ctx> {
             ExprKind::Let { bindings, body } => {
                 let mut scoped = env.clone();
                 for binding in bindings {
-                    if let ExprKind::Lambda { formals: params, body } = &binding.value.kind {
+                    if let ExprKind::Lambda {
+                        formals: params,
+                        body,
+                    } = &binding.value.kind
+                    {
                         scoped.insert(
                             binding.name.clone(),
                             BindingKind::Function(
@@ -4976,15 +5675,18 @@ impl<'ctx> Compiler<'ctx> {
             ExprKind::LetStar { bindings, body } => {
                 let mut scoped = env.clone();
                 for binding in bindings {
-                    if let ExprKind::Lambda { formals: params, body } = &binding.value.kind {
+                    if let ExprKind::Lambda {
+                        formals: params,
+                        body,
+                    } = &binding.value.kind
+                    {
                         scoped.insert(
                             binding.name.clone(),
-                            BindingKind::Function(self.infer_lambda_signature_with_env(
-                                params,
-                                body,
-                                &scoped,
-                                functions,
-                            )),
+                            BindingKind::Function(
+                                self.infer_lambda_signature_with_env(
+                                    params, body, &scoped, functions,
+                                ),
+                            ),
                         );
                     } else {
                         let kind = self.infer_expr_kind(&binding.value, &scoped, functions);
@@ -5012,7 +5714,11 @@ impl<'ctx> Compiler<'ctx> {
                 }
                 self.infer_expr_kind(body, &scoped, functions)
             }
-            ExprKind::Guard { name, handler, body } => {
+            ExprKind::Guard {
+                name,
+                handler,
+                body,
+            } => {
                 let mut scoped = env.clone();
                 scoped.insert(name.clone(), BindingKind::Value(AbiValueKind::Word));
                 combine_abi_kind(
@@ -5082,9 +5788,7 @@ impl<'ctx> Compiler<'ctx> {
             | ExprKind::Integer(_)
             | ExprKind::Boolean(_)
             | ExprKind::Char(_)
-            | ExprKind::String(_) => {
-                AbiValueKind::Word
-            }
+            | ExprKind::String(_) => AbiValueKind::Word,
             ExprKind::Set { value, .. } => self.infer_param_kind(param, value),
             ExprKind::Quote(_) => AbiValueKind::Word,
             ExprKind::Begin(exprs) => exprs.iter().fold(AbiValueKind::Word, |kind, expr| {
@@ -5150,15 +5854,13 @@ impl<'ctx> Compiler<'ctx> {
                         _ => {}
                     }
                 }
-                args.iter().fold(self.infer_param_kind(param, callee), |kind, arg| {
-                    combine_abi_kind(kind, self.infer_param_kind(param, arg))
-                })
+                args.iter()
+                    .fold(self.infer_param_kind(param, callee), |kind, arg| {
+                        combine_abi_kind(kind, self.infer_param_kind(param, arg))
+                    })
             }
             ExprKind::Lambda { formals, body } => {
-                if formals
-                    .required
-                    .iter()
-                    .any(|candidate| candidate == param)
+                if formals.required.iter().any(|candidate| candidate == param)
                     || formals.rest.as_deref() == Some(param)
                 {
                     AbiValueKind::Word
@@ -5176,7 +5878,10 @@ impl<'ctx> Compiler<'ctx> {
         formals: &Formals,
         body: &Expr,
     ) -> Result<Vec<(String, CaptureKind)>, CompileError> {
-        let env_names = env.keys().cloned().collect::<std::collections::HashSet<_>>();
+        let env_names = env
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
         let mut bound = formals.all_names();
         let mut names = std::collections::BTreeSet::new();
         self.collect_free_vars(body, &env_names, &mut bound, &mut names);
@@ -5184,14 +5889,20 @@ impl<'ctx> Compiler<'ctx> {
         let mut captures = Vec::with_capacity(names.len());
         for name in names {
             let value = env.get(&name).copied().ok_or_else(|| {
-                CompileError::Codegen(format!("captured variable '{name}' is missing from the environment"))
+                CompileError::Codegen(format!(
+                    "captured variable '{name}' is missing from the environment"
+                ))
             })?;
             let kind = match value {
                 CodegenValue::Word(_) | CodegenValue::RootedWord { .. } => {
                     CaptureKind::Value(AbiValueKind::Word)
                 }
-                CodegenValue::MutableBox { .. } => CaptureKind::Value(AbiValueKind::Heap(HeapValueKind::Box)),
-                CodegenValue::HeapObject { kind, .. } => CaptureKind::Value(AbiValueKind::Heap(kind)),
+                CodegenValue::MutableBox { .. } => {
+                    CaptureKind::Value(AbiValueKind::Heap(HeapValueKind::Box))
+                }
+                CodegenValue::HeapObject { kind, .. } => {
+                    CaptureKind::Value(AbiValueKind::Heap(kind))
+                }
                 CodegenValue::Function(info) => CaptureKind::Function(info.signature),
                 CodegenValue::Closure(info) => CaptureKind::Function(info.signature),
             };
@@ -5245,7 +5956,11 @@ impl<'ctx> Compiler<'ctx> {
                     self.collect_free_vars(arg, env_names, bound, out);
                 }
             }
-            ExprKind::Guard { name, handler, body } => {
+            ExprKind::Guard {
+                name,
+                handler,
+                body,
+            } => {
                 self.collect_free_vars(body, env_names, bound, out);
                 let start = bound.len();
                 bound.push(name.clone());
@@ -5255,7 +5970,10 @@ impl<'ctx> Compiler<'ctx> {
             ExprKind::Delay(expr) | ExprKind::Force(expr) => {
                 self.collect_free_vars(expr, env_names, bound, out);
             }
-            ExprKind::Lambda { formals: params, body } => {
+            ExprKind::Lambda {
+                formals: params,
+                body,
+            } => {
                 let start = bound.len();
                 bound.extend(params.all_names());
                 self.collect_free_vars(body, env_names, bound, out);
@@ -5305,9 +6023,13 @@ impl<'ctx> Compiler<'ctx> {
 
         let builder = self.context.create_builder();
         let entry = self.context.append_basic_block(function, "entry");
-        let exception_block = self.context.append_basic_block(function, "exception.return");
+        let exception_block = self
+            .context
+            .append_basic_block(function, "exception.return");
         builder.position_at_end(entry);
-        self.exception_targets.push(ExceptionTarget { block: exception_block });
+        self.exception_targets.push(ExceptionTarget {
+            block: exception_block,
+        });
 
         let closure_env = function.get_first_param().ok_or_else(|| {
             CompileError::Codegen(format!(
@@ -5319,8 +6041,7 @@ impl<'ctx> Compiler<'ctx> {
         let mut env = HashMap::new();
         let formal_names = formals.all_names();
         let mutated_names = self.collect_mutated_names_with_initial(body, formal_names.clone());
-        let pair_mutated_names =
-            self.collect_pair_mutated_names_with_initial(body, formal_names);
+        let pair_mutated_names = self.collect_pair_mutated_names_with_initial(body, formal_names);
         let mut rooted_param_count = 0usize;
         for (index, (name, kind)) in captures.iter().enumerate() {
             let captured = self.load_closure_env_word(
@@ -5331,22 +6052,36 @@ impl<'ctx> Compiler<'ctx> {
             )?;
             let value = match kind {
                 CaptureKind::Value(AbiValueKind::Word) => CodegenValue::Word(captured),
-                CaptureKind::Value(AbiValueKind::Heap(heap_kind)) if *heap_kind == HeapValueKind::Box => {
+                CaptureKind::Value(AbiValueKind::Heap(heap_kind))
+                    if *heap_kind == HeapValueKind::Box =>
+                {
                     CodegenValue::MutableBox {
                         ptr: builder
-                            .build_int_to_ptr(captured, gc_ptr_type(self.context), &format!("closure.capture.{index}.box"))
+                            .build_int_to_ptr(
+                                captured,
+                                gc_ptr_type(self.context),
+                                &format!("closure.capture.{index}.box"),
+                            )
                             .map_err(|error| CompileError::Codegen(error.to_string()))?,
                     }
                 }
                 CaptureKind::Value(AbiValueKind::Heap(heap_kind)) => CodegenValue::HeapObject {
                     ptr: builder
-                        .build_int_to_ptr(captured, gc_ptr_type(self.context), &format!("closure.capture.{index}.ptr"))
+                        .build_int_to_ptr(
+                            captured,
+                            gc_ptr_type(self.context),
+                            &format!("closure.capture.{index}.ptr"),
+                        )
                         .map_err(|error| CompileError::Codegen(error.to_string()))?,
                     kind: *heap_kind,
                 },
                 CaptureKind::Function(signature) => CodegenValue::Closure(ClosureInfo {
                     ptr: builder
-                        .build_int_to_ptr(captured, gc_ptr_type(self.context), &format!("closure.capture.{index}.closure"))
+                        .build_int_to_ptr(
+                            captured,
+                            gc_ptr_type(self.context),
+                            &format!("closure.capture.{index}.closure"),
+                        )
                         .map_err(|error| CompileError::Codegen(error.to_string()))?,
                     signature: *signature,
                 }),
@@ -5355,14 +6090,12 @@ impl<'ctx> Compiler<'ctx> {
         }
 
         for (index, param_name) in formals.required.iter().enumerate() {
-            let param = function
-                .get_nth_param((index + 1) as u32)
-                .ok_or_else(|| {
-                    CompileError::Codegen(format!(
-                        "missing parameter {index} for function '{}'",
-                        function.get_name().to_str().unwrap_or("<lambda>")
-                    ))
-                })?;
+            let param = function.get_nth_param((index + 1) as u32).ok_or_else(|| {
+                CompileError::Codegen(format!(
+                    "missing parameter {index} for function '{}'",
+                    function.get_name().to_str().unwrap_or("<lambda>")
+                ))
+            })?;
             let value = match signature
                 .required_param_kinds
                 .get(index)
@@ -5381,7 +6114,11 @@ impl<'ctx> Compiler<'ctx> {
                 rooted_param_count += 1;
                 self.root_word(
                     &builder,
-                    self.value_to_word(&builder, value, &format!("closure.param.{param_name}.word"))?,
+                    self.value_to_word(
+                        &builder,
+                        value,
+                        &format!("closure.param.{param_name}.word"),
+                    )?,
                     &format!("closure.param.{param_name}.root"),
                 )?
             } else {
@@ -5404,7 +6141,11 @@ impl<'ctx> Compiler<'ctx> {
                 rooted_param_count += 1;
                 self.root_word(
                     &builder,
-                    self.value_to_word(&builder, value, &format!("closure.param.{rest_name}.word"))?,
+                    self.value_to_word(
+                        &builder,
+                        value,
+                        &format!("closure.param.{rest_name}.word"),
+                    )?,
                     &format!("closure.param.{rest_name}.root"),
                 )?
             } else {
@@ -5416,13 +6157,16 @@ impl<'ctx> Compiler<'ctx> {
         self.compile_tail_expr(
             &builder,
             function,
-            CallableKind::Closure,
             signature,
             &env,
             body,
             rooted_param_count,
         )?;
-        self.emit_exception_return_block(exception_block, signature.return_kind, rooted_param_count)?;
+        self.emit_exception_return_block(
+            exception_block,
+            signature.return_kind,
+            rooted_param_count,
+        )?;
         self.exception_targets.pop();
 
         if function.verify(true) {
@@ -5435,11 +6179,143 @@ impl<'ctx> Compiler<'ctx> {
         }
     }
 
+    fn compile_closure_scheme_wrapper(
+        &mut self,
+        wrapper: FunctionValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        signature: FunctionSignature,
+        formals: &Formals,
+    ) -> Result<(), CompileError> {
+        if wrapper.get_first_basic_block().is_some() {
+            return Ok(());
+        }
+
+        let builder = self.context.create_builder();
+        let entry = self.context.append_basic_block(wrapper, "entry");
+        builder.position_at_end(entry);
+        let closure_ptr = wrapper
+            .get_first_param()
+            .ok_or_else(|| {
+                CompileError::Codegen("missing closure parameter for Scheme wrapper".into())
+            })?
+            .into_pointer_value();
+        let args_list = wrapper
+            .get_nth_param(1)
+            .ok_or_else(|| {
+                CompileError::Codegen("missing args parameter for Scheme wrapper".into())
+            })?
+            .into_int_value();
+
+        if !signature.rest {
+            self.assert_list_length(
+                &builder,
+                wrapper,
+                args_list,
+                signature.required_param_kinds.len(),
+            )?;
+        } else {
+            self.assert_list_length_at_least(
+                &builder,
+                wrapper,
+                args_list,
+                signature.required_param_kinds.len(),
+            )?;
+        }
+
+        let mut args = Vec::with_capacity(
+            signature.required_param_kinds.len() + 1 + usize::from(signature.rest),
+        );
+        args.push(closure_ptr.into());
+        for (index, kind) in signature.required_param_kinds.iter().enumerate() {
+            let loaded =
+                self.load_list_element(&builder, args_list, index, *kind, "closure.scheme.arg")?;
+            args.push(self.convert_argument_value(
+                &builder,
+                loaded,
+                *kind,
+                "closure.scheme.arg",
+            )?);
+        }
+        if formals.rest.is_some() {
+            let rest = self.list_tail_word(
+                &builder,
+                args_list,
+                signature.required_param_kinds.len(),
+                "closure.scheme.rest",
+            )?;
+            args.push(rest.into());
+        }
+
+        let result = builder
+            .build_call(function, &args, "closure.scheme.call")
+            .map_err(|error| CompileError::Codegen(error.to_string()))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| {
+                CompileError::Codegen("closure Scheme wrapper did not return a value".into())
+            })?;
+        let tail_pending = builder
+            .build_call(
+                self.runtime.rt_tail_pending,
+                &[],
+                "closure.scheme.tail_pending",
+            )
+            .map_err(|error| CompileError::Codegen(error.to_string()))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CompileError::Codegen("tail pending did not return a value".into()))?
+            .into_int_value();
+        let tail_block = self.context.append_basic_block(wrapper, "tail.pending");
+        let value_block = self.context.append_basic_block(wrapper, "tail.value");
+        builder
+            .build_conditional_branch(tail_pending, tail_block, value_block)
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+
+        builder.position_at_end(tail_block);
+        let marker = builder
+            .build_call(
+                self.runtime.rt_tail_call_marker,
+                &[],
+                "closure.scheme.tail_marker",
+            )
+            .map_err(|error| CompileError::Codegen(error.to_string()))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CompileError::Codegen("tail marker did not return a value".into()))?
+            .into_int_value();
+        builder
+            .build_return(Some(&marker))
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+
+        builder.position_at_end(value_block);
+        let wrapped = match signature.return_kind {
+            AbiValueKind::Word => result.into_int_value(),
+            AbiValueKind::Heap(_) => builder
+                .build_ptr_to_int(
+                    result.into_pointer_value(),
+                    self.word_type(),
+                    "closure.scheme.word",
+                )
+                .map_err(|error| CompileError::Codegen(error.to_string()))?,
+        };
+        builder
+            .build_return(Some(&wrapped))
+            .map_err(|error| CompileError::Codegen(error.to_string()))?;
+        if wrapper.verify(true) {
+            Ok(())
+        } else {
+            Err(CompileError::Codegen(format!(
+                "llvm verification failed for closure Scheme wrapper '{}'",
+                wrapper.get_name().to_str().unwrap_or("<wrapper>")
+            )))
+        }
+    }
+
     fn compile_closure_allocation(
         &self,
         builder: &Builder<'ctx>,
         env: &HashMap<String, CodegenValue<'ctx>>,
-        function: FunctionValue<'ctx>,
+        wrapper: FunctionValue<'ctx>,
         signature: FunctionSignature,
         captures: &[(String, CaptureKind)],
     ) -> Result<CodegenValue<'ctx>, CompileError> {
@@ -5453,7 +6329,9 @@ impl<'ctx> Compiler<'ctx> {
                 .map_err(|error| CompileError::Codegen(error.to_string()))?;
             for (index, (name, _)) in captures.iter().enumerate() {
                 let value = env.get(name).copied().ok_or_else(|| {
-                    CompileError::Codegen(format!("captured variable '{name}' is missing from the environment"))
+                    CompileError::Codegen(format!(
+                        "captured variable '{name}' is missing from the environment"
+                    ))
                 })?;
                 let word = self.value_to_word(builder, value, "closure capture")?;
                 let slot = unsafe {
@@ -5476,7 +6354,7 @@ impl<'ctx> Compiler<'ctx> {
 
         let code_ptr = builder
             .build_ptr_to_int(
-                function.as_global_value().as_pointer_value(),
+                wrapper.as_global_value().as_pointer_value(),
                 self.word_type(),
                 "closure.code.ptr",
             )
@@ -5487,14 +6365,18 @@ impl<'ctx> Compiler<'ctx> {
                 &[
                     code_ptr.into(),
                     env_ptr.into(),
-                    self.word_type().const_int(captures.len() as u64, false).into(),
+                    self.word_type()
+                        .const_int(captures.len() as u64, false)
+                        .into(),
                 ],
                 "closure.alloc",
             )
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
-            .ok_or_else(|| CompileError::Codegen("closure allocation did not return a value".into()))?
+            .ok_or_else(|| {
+                CompileError::Codegen("closure allocation did not return a value".into())
+            })?
             .into_pointer_value();
 
         Ok(CodegenValue::Closure(ClosureInfo {
@@ -5506,7 +6388,7 @@ impl<'ctx> Compiler<'ctx> {
     fn allocate_placeholder_closure(
         &self,
         builder: &Builder<'ctx>,
-        function: FunctionValue<'ctx>,
+        wrapper: FunctionValue<'ctx>,
         signature: FunctionSignature,
         env_len: usize,
     ) -> Result<CodegenValue<'ctx>, CompileError> {
@@ -5541,7 +6423,7 @@ impl<'ctx> Compiler<'ctx> {
         };
         let code_ptr = builder
             .build_ptr_to_int(
-                function.as_global_value().as_pointer_value(),
+                wrapper.as_global_value().as_pointer_value(),
                 self.word_type(),
                 "letrec.closure.code.ptr",
             )
@@ -5559,15 +6441,17 @@ impl<'ctx> Compiler<'ctx> {
             .map_err(|error| CompileError::Codegen(error.to_string()))?
             .try_as_basic_value()
             .basic()
-            .ok_or_else(|| CompileError::Codegen("letrec closure allocation did not return a value".into()))?
+            .ok_or_else(|| {
+                CompileError::Codegen("letrec closure allocation did not return a value".into())
+            })?
             .into_pointer_value();
-        Ok(CodegenValue::Closure(ClosureInfo { ptr: closure, signature }))
+        Ok(CodegenValue::Closure(ClosureInfo {
+            ptr: closure,
+            signature,
+        }))
     }
 
-    fn collect_program_mutations(
-        &self,
-        program: &Program,
-    ) -> std::collections::HashSet<String> {
+    fn collect_program_mutations(&self, program: &Program) -> std::collections::HashSet<String> {
         let mut mutated = std::collections::HashSet::new();
         let mut bound = Vec::new();
         for item in &program.items {
@@ -5580,7 +6464,9 @@ impl<'ctx> Compiler<'ctx> {
                     bound.push(procedure.name.clone());
                     self.collect_mutated_in_expr(&procedure.body, &mut bound, &mut mutated);
                 }
-                TopLevel::Expression(expr) => self.collect_mutated_in_expr(expr, &mut bound, &mut mutated),
+                TopLevel::Expression(expr) => {
+                    self.collect_mutated_in_expr(expr, &mut bound, &mut mutated)
+                }
             }
         }
         mutated
@@ -5600,7 +6486,11 @@ impl<'ctx> Compiler<'ctx> {
                 }
                 TopLevel::Procedure(procedure) => {
                     bound.push(procedure.name.clone());
-                    self.collect_pair_mutated_in_expr(&procedure.body, &mut bound, &mut pair_mutated);
+                    self.collect_pair_mutated_in_expr(
+                        &procedure.body,
+                        &mut bound,
+                        &mut pair_mutated,
+                    );
                 }
                 TopLevel::Expression(expr) => {
                     self.collect_pair_mutated_in_expr(expr, &mut bound, &mut pair_mutated);
@@ -5672,7 +6562,11 @@ impl<'ctx> Compiler<'ctx> {
                 self.collect_mutated_in_expr(then_branch, bound, out);
                 self.collect_mutated_in_expr(else_branch, bound, out);
             }
-            ExprKind::Guard { name, handler, body } => {
+            ExprKind::Guard {
+                name,
+                handler,
+                body,
+            } => {
                 self.collect_mutated_in_expr(body, bound, out);
                 let start = bound.len();
                 bound.push(name.clone());
@@ -5682,7 +6576,10 @@ impl<'ctx> Compiler<'ctx> {
             ExprKind::Delay(expr) | ExprKind::Force(expr) => {
                 self.collect_mutated_in_expr(expr, bound, out);
             }
-            ExprKind::Lambda { formals: params, body } => {
+            ExprKind::Lambda {
+                formals: params,
+                body,
+            } => {
                 let start = bound.len();
                 bound.extend(params.all_names());
                 self.collect_mutated_in_expr(body, bound, out);
@@ -5738,7 +6635,9 @@ impl<'ctx> Compiler<'ctx> {
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Variable(name) = &callee.kind
                     && matches!(name.as_str(), "set-car!" | "set-cdr!")
-                    && let Some(Expr { kind: ExprKind::Variable(target) }) = args.first()
+                    && let Some(Expr {
+                        kind: ExprKind::Variable(target),
+                    }) = args.first()
                     && bound.iter().any(|bound_name| bound_name == target)
                 {
                     out.insert(target.clone());
@@ -5762,7 +6661,11 @@ impl<'ctx> Compiler<'ctx> {
                 self.collect_pair_mutated_in_expr(then_branch, bound, out);
                 self.collect_pair_mutated_in_expr(else_branch, bound, out);
             }
-            ExprKind::Guard { name, handler, body } => {
+            ExprKind::Guard {
+                name,
+                handler,
+                body,
+            } => {
                 self.collect_pair_mutated_in_expr(body, bound, out);
                 let start = bound.len();
                 bound.push(name.clone());
@@ -5772,7 +6675,10 @@ impl<'ctx> Compiler<'ctx> {
             ExprKind::Delay(expr) | ExprKind::Force(expr) => {
                 self.collect_pair_mutated_in_expr(expr, bound, out);
             }
-            ExprKind::Lambda { formals: params, body } => {
+            ExprKind::Lambda {
+                formals: params,
+                body,
+            } => {
                 let start = bound.len();
                 bound.extend(params.all_names());
                 self.collect_pair_mutated_in_expr(body, bound, out);
@@ -5865,10 +6771,12 @@ impl<'ctx> Compiler<'ctx> {
             )
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
 
-        let ok_block = self.context.append_basic_block(current_function, &format!("{name}.ok"));
-        let trap_block =
-            self.context
-                .append_basic_block(current_function, &format!("{name}.trap"));
+        let ok_block = self
+            .context
+            .append_basic_block(current_function, &format!("{name}.ok"));
+        let trap_block = self
+            .context
+            .append_basic_block(current_function, &format!("{name}.trap"));
 
         builder
             .build_conditional_branch(is_fixnum, ok_block, trap_block)
@@ -5925,9 +6833,9 @@ impl<'ctx> Compiler<'ctx> {
                 "{context} expected a Scheme word, but a {} heap reference was produced",
                 heap_kind_name(kind)
             ))),
-            CodegenValue::Function(_) | CodegenValue::Closure(_) => Err(CompileError::Codegen(format!(
-                "{context} expected a Scheme word, but a function was produced"
-            ))),
+            CodegenValue::Function(_) | CodegenValue::Closure(_) => Err(CompileError::Codegen(
+                format!("{context} expected a Scheme word, but a function was produced"),
+            )),
         }
     }
 
@@ -5949,9 +6857,16 @@ impl<'ctx> Compiler<'ctx> {
             CodegenValue::Closure(info) => builder
                 .build_ptr_to_int(info.ptr, self.word_type(), context)
                 .map_err(|error| CompileError::Codegen(error.to_string())),
-            CodegenValue::Function(_) => Err(CompileError::Codegen(format!(
-                "{context} expected a Scheme value, but a function was produced"
-            ))),
+            CodegenValue::Function(info) => {
+                let closure =
+                    self.allocate_placeholder_closure(builder, info.wrapper, info.signature, 0)?;
+                let CodegenValue::Closure(closure) = closure else {
+                    unreachable!()
+                };
+                builder
+                    .build_ptr_to_int(closure.ptr, self.word_type(), context)
+                    .map_err(|error| CompileError::Codegen(error.to_string()))
+            }
         }
     }
 
@@ -5968,18 +6883,22 @@ impl<'ctx> Compiler<'ctx> {
                 heap_kind_name(expected_kind),
                 heap_kind_name(kind)
             ))),
-            CodegenValue::Word(_) | CodegenValue::RootedWord { .. } => Err(CompileError::Codegen(format!(
-                "{context} expected a {} heap reference, but a Scheme word was produced",
-                heap_kind_name(expected_kind)
-            ))),
+            CodegenValue::Word(_) | CodegenValue::RootedWord { .. } => {
+                Err(CompileError::Codegen(format!(
+                    "{context} expected a {} heap reference, but a Scheme word was produced",
+                    heap_kind_name(expected_kind)
+                )))
+            }
             CodegenValue::MutableBox { .. } => Err(CompileError::Codegen(format!(
                 "{context} expected a {} heap reference, but a mutable binding cell was produced",
                 heap_kind_name(expected_kind)
             ))),
-            CodegenValue::Function(_) | CodegenValue::Closure(_) => Err(CompileError::Codegen(format!(
-                "{context} expected a {} heap reference, but a function was produced",
-                heap_kind_name(expected_kind)
-            ))),
+            CodegenValue::Function(_) | CodegenValue::Closure(_) => {
+                Err(CompileError::Codegen(format!(
+                    "{context} expected a {} heap reference, but a function was produced",
+                    heap_kind_name(expected_kind)
+                )))
+            }
         }
     }
 
@@ -6000,10 +6919,11 @@ impl<'ctx> Compiler<'ctx> {
                 phi.add_incoming(&[(&then_word, then_block), (&else_word, else_block)]);
                 Ok(CodegenValue::Word(phi.as_basic_value().into_int_value()))
             }
-            (CodegenValue::RootedWord { .. }, _)
-            | (_, CodegenValue::RootedWord { .. }) => Err(CompileError::Codegen(
-                "if branches cannot currently merge rooted stack values".into(),
-            )),
+            (CodegenValue::RootedWord { .. }, _) | (_, CodegenValue::RootedWord { .. }) => {
+                Err(CompileError::Codegen(
+                    "if branches cannot currently merge rooted stack values".into(),
+                ))
+            }
             (
                 CodegenValue::HeapObject {
                     ptr: then_ptr,
@@ -6057,20 +6977,6 @@ impl<'ctx> Compiler<'ctx> {
                 "if branches must produce the same kind of value".into(),
             )),
         }
-    }
-
-    fn wrap_call_result(
-        &self,
-        kind: AbiValueKind,
-        result: inkwell::values::BasicValueEnum<'ctx>,
-    ) -> Result<CodegenValue<'ctx>, CompileError> {
-        Ok(match kind {
-            AbiValueKind::Word => CodegenValue::Word(result.into_int_value()),
-            AbiValueKind::Heap(kind) => CodegenValue::HeapObject {
-                ptr: result.into_pointer_value(),
-                kind,
-            },
-        })
     }
 
     fn compare_codegen_values(
@@ -6148,15 +7054,13 @@ impl<'ctx> Compiler<'ctx> {
     }
 
     fn trap_intrinsic(&self) -> FunctionValue<'ctx> {
-        self.module
-            .get_function("llvm.trap")
-            .unwrap_or_else(|| {
-                self.module.add_function(
-                    "llvm.trap",
-                    self.context.void_type().fn_type(&[], false),
-                    None,
-                )
-            })
+        self.module.get_function("llvm.trap").unwrap_or_else(|| {
+            self.module.add_function(
+                "llvm.trap",
+                self.context.void_type().fn_type(&[], false),
+                None,
+            )
+        })
     }
 }
 
@@ -6170,6 +7074,11 @@ fn builtin_names() -> &'static [&'static str] {
         "-",
         "*",
         "/",
+        "=",
+        "<",
+        ">",
+        "<=",
+        ">=",
         "not",
         "boolean?",
         "zero?",
@@ -6237,6 +7146,11 @@ fn builtin_procedure_names() -> &'static [&'static str] {
         "-",
         "*",
         "/",
+        "=",
+        "<",
+        ">",
+        "<=",
+        ">=",
         "not",
         "boolean?",
         "zero?",
@@ -6298,20 +7212,21 @@ fn builtin_wrapper_signature(name: &str) -> FunctionSignature {
         "+" | "*" | "list" | "append" | "vector" => (0, true),
         "-" => (1, true),
         "/" => (2, true),
+        "=" | "<" | ">" | "<=" | ">=" => (2, true),
         "map" | "for-each" => (2, true),
-        "not" | "boolean?" | "zero?" | "char?" | "char->integer" | "integer->char"
-        | "symbol?" | "symbol->string" | "string->symbol" | "procedure?" | "list-copy"
-        | "reverse" | "car" | "cdr" | "pair?" | "list?" | "length" | "null?"
-        | "string?" | "string-length" | "display" | "write" | "gc-stress" | "vector?"
-        | "vector-length" => (1, false),
+        "not" | "boolean?" | "zero?" | "char?" | "char->integer" | "integer->char" | "symbol?"
+        | "symbol->string" | "string->symbol" | "procedure?" | "list-copy" | "reverse" | "car"
+        | "cdr" | "pair?" | "list?" | "length" | "null?" | "string?" | "string-length"
+        | "display" | "write" | "gc-stress" | "vector?" | "vector-length" => (1, false),
         "newline" => (0, false),
         "raise" => (1, false),
         "error" => (1, true),
         "apply" => (1, true),
         "char=?" | "char<?" | "char>?" | "char<=?" | "char>=?" => (2, true),
-        "eq?" | "eqv?" | "equal?" | "cons" | "set-car!" | "set-cdr!" | "list-tail"
-        | "list-ref" | "string-ref" | "vector-ref" | "memq" | "memv" | "member"
-        | "assq" | "assv" | "assoc" => (2, false),
+        "eq?" | "eqv?" | "equal?" | "cons" | "set-car!" | "set-cdr!" | "list-tail" | "list-ref"
+        | "string-ref" | "vector-ref" | "memq" | "memv" | "member" | "assq" | "assv" | "assoc" => {
+            (2, false)
+        }
         "vector-set!" => (3, false),
         _ => unreachable!(),
     };
@@ -6353,7 +7268,9 @@ fn combine_abi_kind(left: AbiValueKind, right: AbiValueKind) -> AbiValueKind {
         (AbiValueKind::Word, AbiValueKind::Word) => AbiValueKind::Word,
         (AbiValueKind::Word, heap @ AbiValueKind::Heap(_))
         | (heap @ AbiValueKind::Heap(_), AbiValueKind::Word) => heap,
-        (AbiValueKind::Heap(left_kind), AbiValueKind::Heap(right_kind)) if left_kind == right_kind => {
+        (AbiValueKind::Heap(left_kind), AbiValueKind::Heap(right_kind))
+            if left_kind == right_kind =>
+        {
             AbiValueKind::Heap(left_kind)
         }
         _ => AbiValueKind::Word,

@@ -10,6 +10,7 @@ pub const BOOL_FALSE: usize = 0b0000_0010;
 pub const BOOL_TRUE: usize = 0b0000_0110;
 pub const EMPTY_LIST: usize = 0b0000_1010;
 pub const UNSPECIFIED: usize = 0b0000_1110;
+pub const TAIL_CALL_MARKER: usize = 0b0001_0010;
 pub const CHAR_TAG: usize = 0b100;
 pub const CHAR_SHIFT: usize = 3;
 

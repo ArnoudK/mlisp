@@ -149,9 +149,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                         b'\\' => {
                             index += 1;
                             if index >= bytes.len() {
-                                return Err(CompileError::Lex(
-                                    "unterminated string escape".into(),
-                                ));
+                                return Err(CompileError::Lex("unterminated string escape".into()));
                             }
                             let escaped = match bytes[index] {
                                 b'"' => '"',
@@ -176,7 +174,10 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                     }
                 }
 
-                if !matches!(tokens.last().map(|token| &token.kind), Some(TokenKind::String(_))) {
+                if !matches!(
+                    tokens.last().map(|token| &token.kind),
+                    Some(TokenKind::String(_))
+                ) {
                     return Err(CompileError::Lex(format!(
                         "unterminated string literal starting at byte {start}"
                     )));

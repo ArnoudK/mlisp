@@ -1,6 +1,6 @@
 use crate::layout::{
-    HEADER_TAG_BOX, HEADER_TAG_CLOSURE, HEADER_TAG_PAIR, HEADER_TAG_STRING, HEADER_TAG_SYMBOL,
-    HEADER_TAG_PROMISE, HEADER_TAG_VALUES, HEADER_TAG_VECTOR, ObjectHeader,
+    HEADER_TAG_BOX, HEADER_TAG_CLOSURE, HEADER_TAG_PAIR, HEADER_TAG_PROMISE, HEADER_TAG_STRING,
+    HEADER_TAG_SYMBOL, HEADER_TAG_VALUES, HEADER_TAG_VECTOR, ObjectHeader,
 };
 use crate::value::Value;
 
@@ -85,21 +85,26 @@ pub struct ClosureObject {
 impl ClosureObject {
     pub fn new(code_ptr: usize, env_len: usize, total_bytes: usize) -> Self {
         Self {
-            header: ObjectHeader::new(
-                HeapKind::Closure.as_tag(),
-                total_bytes as u32,
-            ),
+            header: ObjectHeader::new(HeapKind::Closure.as_tag(), total_bytes as u32),
             code_ptr,
             env_len,
         }
     }
 
     pub fn env_ptr(&self) -> *const usize {
-        unsafe { (self as *const Self).cast::<usize>().add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>()) }
+        unsafe {
+            (self as *const Self)
+                .cast::<usize>()
+                .add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>())
+        }
     }
 
     pub fn env_mut_ptr(&mut self) -> *mut usize {
-        unsafe { (self as *mut Self).cast::<usize>().add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>()) }
+        unsafe {
+            (self as *mut Self)
+                .cast::<usize>()
+                .add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>())
+        }
     }
 }
 
@@ -118,11 +123,19 @@ impl StringObject {
     }
 
     pub fn bytes_ptr(&self) -> *const u8 {
-        unsafe { (self as *const Self).cast::<u8>().add(core::mem::size_of::<Self>()) }
+        unsafe {
+            (self as *const Self)
+                .cast::<u8>()
+                .add(core::mem::size_of::<Self>())
+        }
     }
 
     pub fn bytes_mut_ptr(&mut self) -> *mut u8 {
-        unsafe { (self as *mut Self).cast::<u8>().add(core::mem::size_of::<Self>()) }
+        unsafe {
+            (self as *mut Self)
+                .cast::<u8>()
+                .add(core::mem::size_of::<Self>())
+        }
     }
 }
 
@@ -141,11 +154,19 @@ impl SymbolObject {
     }
 
     pub fn bytes_ptr(&self) -> *const u8 {
-        unsafe { (self as *const Self).cast::<u8>().add(core::mem::size_of::<Self>()) }
+        unsafe {
+            (self as *const Self)
+                .cast::<u8>()
+                .add(core::mem::size_of::<Self>())
+        }
     }
 
     pub fn bytes_mut_ptr(&mut self) -> *mut u8 {
-        unsafe { (self as *mut Self).cast::<u8>().add(core::mem::size_of::<Self>()) }
+        unsafe {
+            (self as *mut Self)
+                .cast::<u8>()
+                .add(core::mem::size_of::<Self>())
+        }
     }
 }
 
@@ -164,11 +185,19 @@ impl VectorObject {
     }
 
     pub fn elements_ptr(&self) -> *const usize {
-        unsafe { (self as *const Self).cast::<usize>().add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>()) }
+        unsafe {
+            (self as *const Self)
+                .cast::<usize>()
+                .add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>())
+        }
     }
 
     pub fn elements_mut_ptr(&mut self) -> *mut usize {
-        unsafe { (self as *mut Self).cast::<usize>().add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>()) }
+        unsafe {
+            (self as *mut Self)
+                .cast::<usize>()
+                .add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>())
+        }
     }
 }
 
@@ -187,11 +216,19 @@ impl ValuesObject {
     }
 
     pub fn elements_ptr(&self) -> *const usize {
-        unsafe { (self as *const Self).cast::<usize>().add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>()) }
+        unsafe {
+            (self as *const Self)
+                .cast::<usize>()
+                .add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>())
+        }
     }
 
     pub fn elements_mut_ptr(&mut self) -> *mut usize {
-        unsafe { (self as *mut Self).cast::<usize>().add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>()) }
+        unsafe {
+            (self as *mut Self)
+                .cast::<usize>()
+                .add(core::mem::size_of::<Self>() / core::mem::size_of::<usize>())
+        }
     }
 }
 
@@ -205,7 +242,10 @@ pub struct PromiseObject {
 impl PromiseObject {
     pub fn new(value: Value) -> Self {
         Self {
-            header: ObjectHeader::new(HeapKind::Promise.as_tag(), core::mem::size_of::<Self>() as u32),
+            header: ObjectHeader::new(
+                HeapKind::Promise.as_tag(),
+                core::mem::size_of::<Self>() as u32,
+            ),
             value: value.bits(),
             forced: 0,
         }

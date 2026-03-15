@@ -1,13 +1,17 @@
 use crate::error::RuntimeError;
 use crate::mmtk::{
-    alloc_box_checked, alloc_closure_checked, alloc_pair_checked, alloc_raw_checked,
-    alloc_promise_checked, alloc_string_checked, alloc_symbol_checked, alloc_values_checked, alloc_vector_checked, bind_thread_handle,
-    current_thread, exception_pending_checked, gc_poll_current_checked, gc_stress_checked,
-    initialize_runtime, object_write_post_checked, pop_root_checked, push_root_checked,
-    raise_checked, register_global_root_checked, run_mutator_stress_checked,
-    take_pending_exception_checked, unbind_thread_handle,
+    alloc_box_checked, alloc_closure_checked, alloc_pair_checked, alloc_promise_checked,
+    alloc_raw_checked, alloc_string_checked, alloc_symbol_checked, alloc_values_checked,
+    alloc_vector_checked, bind_thread_handle, current_thread, exception_pending_checked,
+    gc_poll_current_checked, gc_stress_checked, initialize_runtime, object_write_post_checked,
+    pop_root_checked, push_root_checked, raise_checked, register_global_root_checked,
+    request_tail_call_checked, run_mutator_stress_checked, tail_call_pending_checked,
+    take_pending_exception_checked, take_pending_tail_call_checked, unbind_thread_handle,
 };
-use crate::object::{ClosureObject, PairObject, PromiseObject, StringObject, SymbolObject, ValuesObject, VectorObject};
+use crate::object::{
+    ClosureObject, PairObject, PromiseObject, StringObject, SymbolObject, ValuesObject,
+    VectorObject,
+};
 use crate::value::Value;
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -113,7 +117,9 @@ fn intern_symbol(bytes: &[u8]) -> Result<Value, RuntimeError> {
     roots.push(&mut rooted_bits)?;
     let mut slot = Box::new(rooted_bits);
     register_global_root_checked(slot.as_mut() as *mut usize)?;
-    let mut guard = table.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let entry = guard.entry(bytes.to_vec()).or_insert(slot);
     Ok(Value::from_bits(**entry))
 }
@@ -122,59 +128,64 @@ const BUILTIN_ADD: u16 = 0;
 const BUILTIN_SUB: u16 = 1;
 const BUILTIN_MUL: u16 = 2;
 const BUILTIN_DIV: u16 = 3;
-const BUILTIN_NOT: u16 = 4;
-const BUILTIN_BOOLEAN_PREDICATE: u16 = 5;
-const BUILTIN_ZERO_PREDICATE: u16 = 6;
-const BUILTIN_CHAR_PREDICATE: u16 = 7;
-const BUILTIN_CHAR_EQ: u16 = 8;
-const BUILTIN_CHAR_LT: u16 = 9;
-const BUILTIN_CHAR_GT: u16 = 10;
-const BUILTIN_CHAR_LE: u16 = 11;
-const BUILTIN_CHAR_GE: u16 = 12;
-const BUILTIN_CHAR_TO_INTEGER: u16 = 13;
-const BUILTIN_INTEGER_TO_CHAR: u16 = 14;
-const BUILTIN_SYMBOL_PREDICATE: u16 = 15;
-const BUILTIN_SYMBOL_TO_STRING: u16 = 16;
-const BUILTIN_STRING_TO_SYMBOL: u16 = 17;
-const BUILTIN_PROCEDURE_PREDICATE: u16 = 18;
-const BUILTIN_EQ: u16 = 19;
-const BUILTIN_EQV: u16 = 20;
-const BUILTIN_EQUAL: u16 = 21;
-const BUILTIN_LIST: u16 = 22;
-const BUILTIN_APPEND: u16 = 23;
-const BUILTIN_MEMQ: u16 = 24;
-const BUILTIN_MEMV: u16 = 25;
-const BUILTIN_MEMBER: u16 = 26;
-const BUILTIN_ASSQ: u16 = 27;
-const BUILTIN_ASSV: u16 = 28;
-const BUILTIN_ASSOC: u16 = 29;
-const BUILTIN_LIST_COPY: u16 = 30;
-const BUILTIN_REVERSE: u16 = 31;
-const BUILTIN_CONS: u16 = 32;
-const BUILTIN_CAR: u16 = 33;
-const BUILTIN_CDR: u16 = 34;
-const BUILTIN_SET_CAR: u16 = 35;
-const BUILTIN_SET_CDR: u16 = 36;
-const BUILTIN_PAIR_PREDICATE: u16 = 37;
-const BUILTIN_LIST_PREDICATE: u16 = 38;
-const BUILTIN_LENGTH: u16 = 39;
-const BUILTIN_LIST_TAIL: u16 = 40;
-const BUILTIN_LIST_REF: u16 = 41;
-const BUILTIN_NULL_PREDICATE: u16 = 42;
-const BUILTIN_STRING_PREDICATE: u16 = 43;
-const BUILTIN_STRING_LENGTH: u16 = 44;
-const BUILTIN_STRING_REF: u16 = 45;
-const BUILTIN_DISPLAY: u16 = 46;
-const BUILTIN_WRITE: u16 = 47;
-const BUILTIN_NEWLINE: u16 = 48;
-const BUILTIN_GC_STRESS: u16 = 49;
-const BUILTIN_VECTOR: u16 = 50;
-const BUILTIN_VECTOR_PREDICATE: u16 = 51;
-const BUILTIN_VECTOR_LENGTH: u16 = 52;
-const BUILTIN_VECTOR_REF: u16 = 53;
-const BUILTIN_VECTOR_SET: u16 = 54;
-const BUILTIN_RAISE: u16 = 55;
-const BUILTIN_ERROR: u16 = 56;
+const BUILTIN_NUM_EQ: u16 = 4;
+const BUILTIN_NUM_LT: u16 = 5;
+const BUILTIN_NUM_GT: u16 = 6;
+const BUILTIN_NUM_LE: u16 = 7;
+const BUILTIN_NUM_GE: u16 = 8;
+const BUILTIN_NOT: u16 = 9;
+const BUILTIN_BOOLEAN_PREDICATE: u16 = 10;
+const BUILTIN_ZERO_PREDICATE: u16 = 11;
+const BUILTIN_CHAR_PREDICATE: u16 = 12;
+const BUILTIN_CHAR_EQ: u16 = 13;
+const BUILTIN_CHAR_LT: u16 = 14;
+const BUILTIN_CHAR_GT: u16 = 15;
+const BUILTIN_CHAR_LE: u16 = 16;
+const BUILTIN_CHAR_GE: u16 = 17;
+const BUILTIN_CHAR_TO_INTEGER: u16 = 18;
+const BUILTIN_INTEGER_TO_CHAR: u16 = 19;
+const BUILTIN_SYMBOL_PREDICATE: u16 = 20;
+const BUILTIN_SYMBOL_TO_STRING: u16 = 21;
+const BUILTIN_STRING_TO_SYMBOL: u16 = 22;
+const BUILTIN_PROCEDURE_PREDICATE: u16 = 23;
+const BUILTIN_EQ: u16 = 24;
+const BUILTIN_EQV: u16 = 25;
+const BUILTIN_EQUAL: u16 = 26;
+const BUILTIN_LIST: u16 = 27;
+const BUILTIN_APPEND: u16 = 28;
+const BUILTIN_MEMQ: u16 = 29;
+const BUILTIN_MEMV: u16 = 30;
+const BUILTIN_MEMBER: u16 = 31;
+const BUILTIN_ASSQ: u16 = 32;
+const BUILTIN_ASSV: u16 = 33;
+const BUILTIN_ASSOC: u16 = 34;
+const BUILTIN_LIST_COPY: u16 = 35;
+const BUILTIN_REVERSE: u16 = 36;
+const BUILTIN_CONS: u16 = 37;
+const BUILTIN_CAR: u16 = 38;
+const BUILTIN_CDR: u16 = 39;
+const BUILTIN_SET_CAR: u16 = 40;
+const BUILTIN_SET_CDR: u16 = 41;
+const BUILTIN_PAIR_PREDICATE: u16 = 42;
+const BUILTIN_LIST_PREDICATE: u16 = 43;
+const BUILTIN_LENGTH: u16 = 44;
+const BUILTIN_LIST_TAIL: u16 = 45;
+const BUILTIN_LIST_REF: u16 = 46;
+const BUILTIN_NULL_PREDICATE: u16 = 47;
+const BUILTIN_STRING_PREDICATE: u16 = 48;
+const BUILTIN_STRING_LENGTH: u16 = 49;
+const BUILTIN_STRING_REF: u16 = 50;
+const BUILTIN_DISPLAY: u16 = 51;
+const BUILTIN_WRITE: u16 = 52;
+const BUILTIN_NEWLINE: u16 = 53;
+const BUILTIN_GC_STRESS: u16 = 54;
+const BUILTIN_VECTOR: u16 = 55;
+const BUILTIN_VECTOR_PREDICATE: u16 = 56;
+const BUILTIN_VECTOR_LENGTH: u16 = 57;
+const BUILTIN_VECTOR_REF: u16 = 58;
+const BUILTIN_VECTOR_SET: u16 = 59;
+const BUILTIN_RAISE: u16 = 60;
+const BUILTIN_ERROR: u16 = 61;
 
 fn expect_arity(args: &[Value], expected: usize) -> Result<(), RuntimeError> {
     if args.len() == expected {
@@ -193,6 +204,25 @@ fn expect_char(value: Value) -> Result<char, RuntimeError> {
         Some(crate::value::Immediate::Char(ch)) => Ok(ch),
         _ => Err(RuntimeError::InvalidObjectKind),
     }
+}
+
+fn apply_fixnum_comparison<F>(args: &[Value], predicate: F) -> Result<Value, RuntimeError>
+where
+    F: Fn(i64, i64) -> bool,
+{
+    if args.len() < 2 {
+        return Err(RuntimeError::InvalidObjectKind);
+    }
+    let mut iter = args.iter().copied().map(expect_fixnum);
+    let mut previous = iter.next().ok_or(RuntimeError::InvalidObjectKind)??;
+    for current in iter {
+        let current = current?;
+        if !predicate(previous, current) {
+            return Ok(Value::encode_bool(false));
+        }
+        previous = current;
+    }
+    Ok(Value::encode_bool(true))
 }
 
 fn collect_list_elements(mut value: Value) -> Result<Vec<Value>, RuntimeError> {
@@ -273,6 +303,12 @@ fn write_value(
         Some(crate::value::Immediate::Unspecified) => {
             writer
                 .write_all(b"#<unspecified>")
+                .map_err(|error| RuntimeError::io_like(error))?;
+            return Ok(());
+        }
+        Some(crate::value::Immediate::TailCallMarker) => {
+            writer
+                .write_all(b"#<tail-call>")
                 .map_err(|error| RuntimeError::io_like(error))?;
             return Ok(());
         }
@@ -464,6 +500,12 @@ fn write_scheme_value(writer: &mut dyn Write, value: Value) -> Result<(), Runtim
         Some(crate::value::Immediate::Unspecified) => {
             writer
                 .write_all(b"#<unspecified>")
+                .map_err(|error| RuntimeError::io_like(error))?;
+            return Ok(());
+        }
+        Some(crate::value::Immediate::TailCallMarker) => {
+            writer
+                .write_all(b"#<tail-call>")
                 .map_err(|error| RuntimeError::io_like(error))?;
             return Ok(());
         }
@@ -827,10 +869,8 @@ fn equal_value(left: Value, right: Value) -> Result<bool, RuntimeError> {
         crate::layout::HEADER_TAG_PAIR => {
             let left_pair = unsafe { &*left_object.to_raw_address().to_ptr::<PairObject>() };
             let right_pair = unsafe { &*right_object.to_raw_address().to_ptr::<PairObject>() };
-            Ok(
-                equal_value(left_pair.car(), right_pair.car())?
-                    && equal_value(left_pair.cdr(), right_pair.cdr())?,
-            )
+            Ok(equal_value(left_pair.car(), right_pair.car())?
+                && equal_value(left_pair.cdr(), right_pair.cdr())?)
         }
         crate::layout::HEADER_TAG_STRING => {
             let left_string = unsafe { &*left_object.to_raw_address().to_ptr::<StringObject>() };
@@ -876,10 +916,16 @@ fn equal_value(left: Value, right: Value) -> Result<bool, RuntimeError> {
             Ok(true)
         }
         crate::layout::HEADER_TAG_BOX => {
-            let left_box =
-                unsafe { &*left_object.to_raw_address().to_ptr::<crate::object::BoxObject>() };
-            let right_box =
-                unsafe { &*right_object.to_raw_address().to_ptr::<crate::object::BoxObject>() };
+            let left_box = unsafe {
+                &*left_object
+                    .to_raw_address()
+                    .to_ptr::<crate::object::BoxObject>()
+            };
+            let right_box = unsafe {
+                &*right_object
+                    .to_raw_address()
+                    .to_ptr::<crate::object::BoxObject>()
+            };
             equal_value(left_box.value(), right_box.value())
         }
         crate::layout::HEADER_TAG_VALUES => {
@@ -948,10 +994,17 @@ fn apply_builtin_value(id: u16, list: Value) -> Result<Value, RuntimeError> {
             let mut total = expect_fixnum(*first)?;
             for value in rest {
                 let divisor = expect_fixnum(*value)?;
-                total = total.checked_div(divisor).ok_or(RuntimeError::FixnumOutOfRange)?;
+                total = total
+                    .checked_div(divisor)
+                    .ok_or(RuntimeError::FixnumOutOfRange)?;
             }
             Value::encode_fixnum(total).ok_or(RuntimeError::FixnumOutOfRange)
         }
+        BUILTIN_NUM_EQ => apply_fixnum_comparison(&args, |left, right| left == right),
+        BUILTIN_NUM_LT => apply_fixnum_comparison(&args, |left, right| left < right),
+        BUILTIN_NUM_GT => apply_fixnum_comparison(&args, |left, right| left > right),
+        BUILTIN_NUM_LE => apply_fixnum_comparison(&args, |left, right| left <= right),
+        BUILTIN_NUM_GE => apply_fixnum_comparison(&args, |left, right| left >= right),
         BUILTIN_NOT => {
             expect_arity(&args, 1)?;
             Ok(Value::encode_bool(
@@ -1005,7 +1058,8 @@ fn apply_builtin_value(id: u16, list: Value) -> Result<Value, RuntimeError> {
         }
         BUILTIN_INTEGER_TO_CHAR => {
             expect_arity(&args, 1)?;
-            let scalar = u32::try_from(expect_fixnum(args[0])?).map_err(|_| RuntimeError::InvalidObjectKind)?;
+            let scalar = u32::try_from(expect_fixnum(args[0])?)
+                .map_err(|_| RuntimeError::InvalidObjectKind)?;
             let ch = char::from_u32(scalar).ok_or(RuntimeError::InvalidObjectKind)?;
             Ok(Value::encode_char(ch))
         }
@@ -1097,7 +1151,9 @@ fn apply_builtin_value(id: u16, list: Value) -> Result<Value, RuntimeError> {
         }
         BUILTIN_CONS => {
             expect_arity(&args, 2)?;
-            Ok(Value::from_object_reference(alloc_pair_checked(args[0], args[1])?))
+            Ok(Value::from_object_reference(alloc_pair_checked(
+                args[0], args[1],
+            )?))
         }
         BUILTIN_CAR => {
             expect_arity(&args, 1)?;
@@ -1146,11 +1202,19 @@ fn apply_builtin_value(id: u16, list: Value) -> Result<Value, RuntimeError> {
         }
         BUILTIN_LIST_TAIL => {
             expect_arity(&args, 2)?;
-            list_tail_value(args[0], usize::try_from(expect_fixnum(args[1])?).map_err(|_| RuntimeError::IndexOutOfBounds)?)
+            list_tail_value(
+                args[0],
+                usize::try_from(expect_fixnum(args[1])?)
+                    .map_err(|_| RuntimeError::IndexOutOfBounds)?,
+            )
         }
         BUILTIN_LIST_REF => {
             expect_arity(&args, 2)?;
-            list_ref_value(args[0], usize::try_from(expect_fixnum(args[1])?).map_err(|_| RuntimeError::IndexOutOfBounds)?)
+            list_ref_value(
+                args[0],
+                usize::try_from(expect_fixnum(args[1])?)
+                    .map_err(|_| RuntimeError::IndexOutOfBounds)?,
+            )
         }
         BUILTIN_NULL_PREDICATE => {
             expect_arity(&args, 1)?;
@@ -1172,7 +1236,8 @@ fn apply_builtin_value(id: u16, list: Value) -> Result<Value, RuntimeError> {
             expect_arity(&args, 2)?;
             Ok(Value::from_bits(mlisp_string_ref(
                 args[0].bits(),
-                usize::try_from(expect_fixnum(args[1])?).map_err(|_| RuntimeError::IndexOutOfBounds)?,
+                usize::try_from(expect_fixnum(args[1])?)
+                    .map_err(|_| RuntimeError::IndexOutOfBounds)?,
             )))
         }
         BUILTIN_DISPLAY => {
@@ -1202,7 +1267,9 @@ fn apply_builtin_value(id: u16, list: Value) -> Result<Value, RuntimeError> {
         }
         BUILTIN_VECTOR => {
             let elements = args;
-            Ok(Value::from_object_reference(alloc_vector_checked(&elements)?))
+            Ok(Value::from_object_reference(alloc_vector_checked(
+                &elements,
+            )?))
         }
         BUILTIN_VECTOR_PREDICATE => {
             expect_arity(&args, 1)?;
@@ -1218,14 +1285,16 @@ fn apply_builtin_value(id: u16, list: Value) -> Result<Value, RuntimeError> {
             expect_arity(&args, 2)?;
             Ok(Value::from_bits(mlisp_vector_ref(
                 args[0].bits(),
-                usize::try_from(expect_fixnum(args[1])?).map_err(|_| RuntimeError::IndexOutOfBounds)?,
+                usize::try_from(expect_fixnum(args[1])?)
+                    .map_err(|_| RuntimeError::IndexOutOfBounds)?,
             )))
         }
         BUILTIN_VECTOR_SET => {
             expect_arity(&args, 3)?;
             Ok(Value::from_bits(mlisp_vector_set(
                 args[0].bits(),
-                usize::try_from(expect_fixnum(args[1])?).map_err(|_| RuntimeError::IndexOutOfBounds)?,
+                usize::try_from(expect_fixnum(args[1])?)
+                    .map_err(|_| RuntimeError::IndexOutOfBounds)?,
                 args[2].bits(),
             )))
         }
@@ -1267,7 +1336,9 @@ fn values_ref(value: Value, index: usize) -> Result<Value, RuntimeError> {
     if index >= values.length {
         return Err(RuntimeError::IndexOutOfBounds);
     }
-    Ok(Value::from_bits(unsafe { *values.elements_ptr().add(index) }))
+    Ok(Value::from_bits(unsafe {
+        *values.elements_ptr().add(index)
+    }))
 }
 
 fn values_tail_list(value: Value, start: usize) -> Result<Value, RuntimeError> {
@@ -1315,11 +1386,9 @@ fn make_error_value(args: &[Value]) -> Result<Value, RuntimeError> {
     roots.push(&mut result_bits)?;
 
     for value in args.iter().rev().copied() {
-        result_bits = Value::from_object_reference(alloc_pair_checked(
-            value,
-            Value::from_bits(result_bits),
-        )?)
-        .bits();
+        result_bits =
+            Value::from_object_reference(alloc_pair_checked(value, Value::from_bits(result_bits))?)
+                .bits();
     }
     result_bits = Value::from_object_reference(alloc_pair_checked(
         Value::from_bits(symbol_bits),
@@ -1380,6 +1449,59 @@ pub extern "C" fn rt_raise(value: usize) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn rt_take_pending_exception() -> usize {
     ffi_word(|| Ok(take_pending_exception_checked()?.bits()))
+}
+
+type TailCallable = unsafe extern "C" fn(*mut core::ffi::c_void, usize) -> usize;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_tail_call_marker() -> usize {
+    Value::tail_call_marker().bits()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_tail_pending() -> bool {
+    ffi_bool(tail_call_pending_checked)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_tail_invoke(code_ptr: usize, closure: usize, args: usize) -> usize {
+    ffi_word(|| {
+        request_tail_call_checked(code_ptr, Value::from_bits(closure), Value::from_bits(args))?;
+        Ok(Value::tail_call_marker().bits())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rt_trampoline_apply(code_ptr: usize, closure: usize, args: usize) -> usize {
+    ffi_word(|| {
+        if code_ptr == 0 {
+            return Err(RuntimeError::InvalidTrampolineState);
+        }
+
+        let thread = current_thread();
+        let mut current_closure = closure;
+        let mut current_args = args;
+        let mut roots = RootGuard::new(thread);
+        roots.push(&mut current_closure)?;
+        roots.push(&mut current_args)?;
+        let mut current_code = code_ptr;
+
+        loop {
+            let callable: TailCallable = unsafe { core::mem::transmute(current_code) };
+            let result =
+                unsafe { callable(current_closure as *mut core::ffi::c_void, current_args) };
+            if result != Value::tail_call_marker().bits() {
+                return Ok(result);
+            }
+            let Some((next_code, next_closure, next_args)) = take_pending_tail_call_checked()?
+            else {
+                return Err(RuntimeError::InvalidTrampolineState);
+            };
+            current_code = next_code;
+            current_closure = next_closure.bits();
+            current_args = next_args.bits();
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1572,7 +1694,9 @@ pub extern "C" fn mlisp_promise_forced(value: usize) -> bool {
         if object_kind(value)? != crate::layout::HEADER_TAG_PROMISE {
             return Err(RuntimeError::InvalidObjectKind);
         }
-        let object = value.to_object_reference().ok_or(RuntimeError::InvalidObjectKind)?;
+        let object = value
+            .to_object_reference()
+            .ok_or(RuntimeError::InvalidObjectKind)?;
         Ok(unsafe { (*object.to_raw_address().to_ptr::<PromiseObject>()).is_forced() })
     })
 }
@@ -1584,7 +1708,9 @@ pub extern "C" fn mlisp_promise_value(value: usize) -> usize {
         if object_kind(value)? != crate::layout::HEADER_TAG_PROMISE {
             return Err(RuntimeError::InvalidObjectKind);
         }
-        let object = value.to_object_reference().ok_or(RuntimeError::InvalidObjectKind)?;
+        let object = value
+            .to_object_reference()
+            .ok_or(RuntimeError::InvalidObjectKind)?;
         Ok(unsafe { (*object.to_raw_address().to_ptr::<PromiseObject>()).value() }.bits())
     })
 }
@@ -1596,7 +1722,9 @@ pub extern "C" fn mlisp_promise_resolve(value: usize, resolved: usize) -> usize 
         if object_kind(value)? != crate::layout::HEADER_TAG_PROMISE {
             return Err(RuntimeError::InvalidObjectKind);
         }
-        let object = value.to_object_reference().ok_or(RuntimeError::InvalidObjectKind)?;
+        let object = value
+            .to_object_reference()
+            .ok_or(RuntimeError::InvalidObjectKind)?;
         let promise = object.to_raw_address().to_mut_ptr::<PromiseObject>();
         object_write_post_checked(
             object,
@@ -2239,10 +2367,9 @@ pub unsafe extern "C" fn mlisp_pair_set_car_gc(pair: *mut PairObject, element: u
         if pair.is_null() {
             return Err(RuntimeError::InvalidObjectKind);
         }
-        let object = mmtk::util::ObjectReference::from_raw_address(
-            mmtk::util::Address::from_mut_ptr(pair),
-        )
-        .ok_or(RuntimeError::InvalidObjectKind)?;
+        let object =
+            mmtk::util::ObjectReference::from_raw_address(mmtk::util::Address::from_mut_ptr(pair))
+                .ok_or(RuntimeError::InvalidObjectKind)?;
         object_write_post_checked(
             object,
             unsafe { core::ptr::addr_of_mut!((*pair).car) },
@@ -2277,10 +2404,9 @@ pub unsafe extern "C" fn mlisp_pair_set_cdr_gc(pair: *mut PairObject, element: u
         if pair.is_null() {
             return Err(RuntimeError::InvalidObjectKind);
         }
-        let object = mmtk::util::ObjectReference::from_raw_address(
-            mmtk::util::Address::from_mut_ptr(pair),
-        )
-        .ok_or(RuntimeError::InvalidObjectKind)?;
+        let object =
+            mmtk::util::ObjectReference::from_raw_address(mmtk::util::Address::from_mut_ptr(pair))
+                .ok_or(RuntimeError::InvalidObjectKind)?;
         object_write_post_checked(
             object,
             unsafe { core::ptr::addr_of_mut!((*pair).cdr) },
@@ -2330,9 +2456,11 @@ pub extern "C" fn mlisp_append(left: usize, right: usize) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn mlisp_memq(value: usize, list: usize) -> usize {
     ffi_word(|| {
-        Ok(member_with(Value::from_bits(value), Value::from_bits(list), |left, right| {
-            Ok(left == right)
-        })?
+        Ok(member_with(
+            Value::from_bits(value),
+            Value::from_bits(list),
+            |left, right| Ok(left == right),
+        )?
         .bits())
     })
 }
@@ -2340,9 +2468,11 @@ pub extern "C" fn mlisp_memq(value: usize, list: usize) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn mlisp_memv(value: usize, list: usize) -> usize {
     ffi_word(|| {
-        Ok(member_with(Value::from_bits(value), Value::from_bits(list), |left, right| {
-            Ok(left == right)
-        })?
+        Ok(member_with(
+            Value::from_bits(value),
+            Value::from_bits(list),
+            |left, right| Ok(left == right),
+        )?
         .bits())
     })
 }
@@ -2350,21 +2480,18 @@ pub extern "C" fn mlisp_memv(value: usize, list: usize) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn mlisp_member(value: usize, list: usize) -> usize {
     ffi_word(|| {
-        Ok(member_with(
-            Value::from_bits(value),
-            Value::from_bits(list),
-            equal_value,
-        )?
-        .bits())
+        Ok(member_with(Value::from_bits(value), Value::from_bits(list), equal_value)?.bits())
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mlisp_assq(value: usize, list: usize) -> usize {
     ffi_word(|| {
-        Ok(assoc_with(Value::from_bits(value), Value::from_bits(list), |left, right| {
-            Ok(left == right)
-        })?
+        Ok(assoc_with(
+            Value::from_bits(value),
+            Value::from_bits(list),
+            |left, right| Ok(left == right),
+        )?
         .bits())
     })
 }
@@ -2372,9 +2499,11 @@ pub extern "C" fn mlisp_assq(value: usize, list: usize) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn mlisp_assv(value: usize, list: usize) -> usize {
     ffi_word(|| {
-        Ok(assoc_with(Value::from_bits(value), Value::from_bits(list), |left, right| {
-            Ok(left == right)
-        })?
+        Ok(assoc_with(
+            Value::from_bits(value),
+            Value::from_bits(list),
+            |left, right| Ok(left == right),
+        )?
         .bits())
     })
 }
@@ -2382,12 +2511,7 @@ pub extern "C" fn mlisp_assv(value: usize, list: usize) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn mlisp_assoc(value: usize, list: usize) -> usize {
     ffi_word(|| {
-        Ok(assoc_with(
-            Value::from_bits(value),
-            Value::from_bits(list),
-            equal_value,
-        )?
-        .bits())
+        Ok(assoc_with(Value::from_bits(value), Value::from_bits(list), equal_value)?.bits())
     })
 }
 
@@ -2414,9 +2538,11 @@ mod tests {
         mlisp_values_length, mlisp_values_ref, mlisp_values_tail_list, mlisp_vector_length,
         mlisp_vector_length_gc, mlisp_vector_ref, mlisp_vector_ref_gc, mlisp_vector_set,
         mlisp_vector_set_gc, rt_bind_thread, rt_exception_pending, rt_gc_poll, rt_mmtk_init,
-        rt_raise, rt_run_mutator_stress, rt_take_pending_exception, rt_unbind_thread,
+        rt_raise, rt_run_mutator_stress, rt_tail_call_marker, rt_tail_invoke, rt_tail_pending,
+        rt_take_pending_exception, rt_trampoline_apply, rt_unbind_thread,
     };
     use crate::value::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn allocates_pair_through_mmtk_runtime() {
@@ -2538,7 +2664,11 @@ mod tests {
     fn allocates_and_reads_values_packets_through_runtime() {
         assert!(rt_mmtk_init(8 * 1024 * 1024, 1));
         let thread = rt_bind_thread();
-        let elements = [mlisp_make_fixnum(1), mlisp_make_fixnum(2), mlisp_make_fixnum(3)];
+        let elements = [
+            mlisp_make_fixnum(1),
+            mlisp_make_fixnum(2),
+            mlisp_make_fixnum(3),
+        ];
         let values = unsafe { mlisp_alloc_values(elements.as_ptr(), elements.len()) };
         assert!(mlisp_is_values(values));
         assert_eq!(
@@ -2610,10 +2740,7 @@ mod tests {
         let found = super::mlisp_memq(symbol_b, list);
         assert!(mlisp_is_list(found));
 
-        let pair_b = mlisp_alloc_pair(
-            symbol_b,
-            mlisp_make_fixnum(2),
-        );
+        let pair_b = mlisp_alloc_pair(symbol_b, mlisp_make_fixnum(2));
         let alist = mlisp_alloc_pair(pair_b, empty);
         let assoc = super::mlisp_assq(symbol_b, alist);
         assert!(mlisp_is_pair(assoc));
@@ -2633,7 +2760,10 @@ mod tests {
             mlisp_pair_set_car(rooted_pair, mlisp_make_fixnum(9)),
             Value::unspecified().bits()
         );
-        assert_eq!(mlisp_pair_set_cdr(rooted_pair, empty), Value::unspecified().bits());
+        assert_eq!(
+            mlisp_pair_set_cdr(rooted_pair, empty),
+            Value::unspecified().bits()
+        );
         assert!(mlisp_is_pair(rooted_pair));
         assert_eq!(
             Value::from_bits(unsafe { mlisp_pair_car(rooted_pair) }).decode_fixnum(),
@@ -2719,5 +2849,59 @@ mod tests {
             Value::unspecified().bits()
         );
         unsafe { rt_unbind_thread(core::ptr::null_mut()) };
+    }
+
+    static TRAMPOLINE_STATE: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn trampoline_first(_closure: *mut core::ffi::c_void, args: usize) -> usize {
+        if TRAMPOLINE_STATE.fetch_add(1, Ordering::SeqCst) == 0 {
+            rt_tail_invoke(trampoline_second as *const () as usize, 0, args)
+        } else {
+            args
+        }
+    }
+
+    unsafe extern "C" fn trampoline_second(_closure: *mut core::ffi::c_void, args: usize) -> usize {
+        args
+    }
+
+    #[test]
+    fn runs_runtime_tail_trampoline() {
+        assert!(rt_mmtk_init(8 * 1024 * 1024, 1));
+        let thread = rt_bind_thread();
+        TRAMPOLINE_STATE.store(0, Ordering::SeqCst);
+        let value = mlisp_make_fixnum(17);
+        assert_eq!(
+            rt_trampoline_apply(trampoline_first as *const () as usize, 0, value),
+            value
+        );
+        assert!(!rt_tail_pending());
+        unsafe { rt_unbind_thread(thread) };
+    }
+
+    unsafe extern "C" fn trampoline_gc_first(
+        _closure: *mut core::ffi::c_void,
+        args: usize,
+    ) -> usize {
+        let _ = rt_tail_invoke(trampoline_gc_second as *const () as usize, 0, args);
+        rt_gc_poll();
+        rt_tail_call_marker()
+    }
+
+    unsafe extern "C" fn trampoline_gc_second(
+        _closure: *mut core::ffi::c_void,
+        args: usize,
+    ) -> usize {
+        unsafe { mlisp_pair_car(args) }
+    }
+
+    #[test]
+    fn roots_pending_tail_request_across_gc() {
+        assert!(rt_mmtk_init(8 * 1024 * 1024, 1));
+        let thread = rt_bind_thread();
+        let pair = mlisp_alloc_pair(mlisp_make_fixnum(23), mlisp_make_fixnum(24));
+        let result = rt_trampoline_apply(trampoline_gc_first as *const () as usize, 0, pair);
+        assert_eq!(Value::from_bits(result).decode_fixnum(), Some(23));
+        unsafe { rt_unbind_thread(thread) };
     }
 }

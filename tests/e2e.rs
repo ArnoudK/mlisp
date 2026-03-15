@@ -14,7 +14,11 @@ fn runs_file_based_end_to_end_cases() {
         .collect::<Vec<_>>();
     cases.sort();
 
-    assert!(!cases.is_empty(), "no e2e Scheme cases found in {}", root.display());
+    assert!(
+        !cases.is_empty(),
+        "no e2e Scheme cases found in {}",
+        root.display()
+    );
 
     let mut failures = Vec::new();
     for case in cases {
@@ -30,10 +34,14 @@ fn runs_file_based_end_to_end_cases() {
 
 fn run_case(case: &Path) -> Result<(), String> {
     let expected = expected_output_path(case);
-    let expected_output = fs::read_to_string(&expected)
-        .map_err(|error| format!("{}: failed to read expected output: {error}", case.display()))?;
-    let output = run_path(case)
-        .map_err(|error| format!("{}: run failed: {error}", case.display()))?;
+    let expected_output = fs::read_to_string(&expected).map_err(|error| {
+        format!(
+            "{}: failed to read expected output: {error}",
+            case.display()
+        )
+    })?;
+    let output =
+        run_path(case).map_err(|error| format!("{}: run failed: {error}", case.display()))?;
 
     if output.exit_code != 0 {
         return Err(format!(
